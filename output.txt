@@ -1,0 +1,85 @@
+/root/miniconda3/envs/executorch_env/lib/python3.10/site-packages/executorch/exir/dialects/edge/_ops.py:9: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+
+
+[33mWARN[0m  Python GIL is enabled: Multi-gpu quant acceleration for MoE models is sub-optimal and multi-core accelerated cpu packing is also disabled. We recommend Python >= 3.13.3t with Pytorch > 2.8 for mult-gpu quantization and multi-cpu packing with env `PYTHON_GIL=0`.
+
+[33mWARN[0m  Feature `utils/Perplexity` requires python GIL or Python > 3.13.3T (T for Threading-Free edition of Python) plus Torch 2.8. Feature is currently skipped/disabled.
+
+[32mINFO[0m  ENV: Auto setting PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' for memory saving.
+
+[32mINFO[0m  ENV: Auto setting CUDA_DEVICE_ORDER=PCI_BUS_ID for correctness.       
+
+
+
+
+/workspaces/tman/models/Qwen3-1.7B-GPTQ-Int4/qwen_qnn/kv_llama_qnn.pte: 1 file pushed, 0 skipped. 42.4 MB/s (1512431636 bytes in 34.029s)
+/opt/qnn/lib/aarch64-android/libQnnHtp.so: 1 file pushed, 0 skipped. 153.2 MB/s (2465168 bytes in 0.015s)
+/opt/qnn/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so: 1 file pushed, 0 skipped. 199.7 MB/s (9243452 bytes in 0.044s)
+/opt/qnn/lib/aarch64-android/libQnnHtpV75Stub.so: 1 file pushed, 0 skipped. 158.9 MB/s (713912 bytes in 0.004s)
+/opt/qnn/lib/aarch64-android/libQnnHtpPrepare.so: 1 file pushed, 0 skipped. 101.7 MB/s (69147960 bytes in 0.648s)
+/opt/qnn/lib/aarch64-android/libQnnSystem.so: 1 file pushed, 0 skipped. 131.9 MB/s (2549880 bytes in 0.018s)
+/workspaces/tman/test/executorch/build-android/examples/qualcomm/oss_scripts/llama/qnn_llama_runner: 1 file pushed, 0 skipped. 188.3 MB/s (60084616 bytes in 0.304s)
+/workspaces/tman/test/executorch/build-android/backends/qualcomm/libqnn_executorch_backend.so: 1 file pushed, 0 skipped. 147.1 MB/s (1246824 bytes in 0.008s)
+/opt/qnn/lib/aarch64-android/libQnnModelDlc.so: 1 file pushed, 0 skipped. 172.7 MB/s (2479520 bytes in 0.014s)
+/workspaces/tman/models/Qwen3-1.7B-GPTQ-Int4/qwen_qnn/input_list.txt: 1 file pushed, 0 skipped.
+/workspaces/tman/models/Qwen3-1.7B-GPTQ-Int4/tokenizer.json: 1 file pushed, 0 skipped. 249.6 MB/s (11422654 bytes in 0.044s)
+
+
+[INFO] [Qnn ExecuTorch]: Deserializing processed data using QnnContextCustomProtocol
+[INFO] [Qnn ExecuTorch]: create QNN Logger with log_level 2
+[WARNING] [Qnn ExecuTorch]: QnnDsp <W> Initializing HtpProvider
+
+[INFO] [Qnn ExecuTorch]: Registered Op Package: /data/local/tmp/llama/libQnnTMANOpPackage.so and interface provider: TMANOpPackageInterfaceProvider
+[INFO] [Qnn ExecuTorch]: QnnDlcManager Get Qnn Context blob bytes 1512321024
+[INFO] [Qnn ExecuTorch]: Initialize Qnn backend parameters for Qnn executorch backend type 2
+[INFO] [Qnn ExecuTorch]: Caching: Caching is in RESTORE MODE.
+[INFO] [Qnn ExecuTorch]: QnnContextCustomProtocol expected magic number: 0x5678abcd but get: 0x2000000
+#表明协议中期望的魔数与实际值不匹配，可能是数据格式或版本问题。
+[INFO] [Qnn ExecuTorch]: Running level=1 optimization.
+Setting up pretokenizer...
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1770062824.327464    9195 re2.cc:237] Error parsing '((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s...': invalid perl operator: (?!
+RE2 is unable to support things such as negative lookaheads in (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+, using PCRE2 instead.
+#表明 RE2 正则表达式引擎无法支持某些复杂的正则表达式（如负向前瞻），切换到 PCRE2 引擎
+Pretokenizer set up
+[INFO] [Qnn ExecuTorch]: Destroy Qnn backend parameters
+[INFO] [Qnn ExecuTorch]: Destroy Qnn context
+[INFO] [Qnn ExecuTorch]: Destroy Qnn device
+#提供了推理的性能数据：
+输入的 prompt 包含 60 个 token。
+模型生成了 67 个 token。
+推理时间为约 3 秒（inference_end_ms - inference_start_ms）。
+每秒生成约 40.9 个 token。
+PyTorchObserver {
+  "prompt_tokens":60,
+  "generated_tokens":67,
+  "model_load_start_ms":1770062823640,
+  "model_load_end_ms":1770062824373,
+  "inference_start_ms":1770062824373,
+  "inference_end_ms":1770062827461,
+  "prompt_eval_end_ms":1770062825823,
+  "first_token_ms":1770062825847,
+  "tokens_per_second":40.9035,
+  "aggregate_sampling_time_ms":196,
+  "SCALING_FACTOR_UNITS_PER_SECOND":1000}
+
+[INFO] [Qnn ExecuTorch]: Destroy Qnn backend
+/data/local/tmp/root/executorch/single_llama/outputs/: 2 files pulled, 0 skipped. 0.0 MB/s (521 bytes in 0.045s)
+
+推理输出：
+INFO:root:Results[0]:
+<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+<|im_start|>user
+Are you conscious?<|im_end|>
+<|im_start|>assistant
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+</think>
+
+Okay, I need to figure out how to answer the question "Are you conscious?" Let me start by understanding the user's query.
+
+The user is asking if I am conscious. That's a philosophical and possibly existential question. I know that the user might be testing my ability to think through such a question. I need to respond
+QNN_SDK_ROOT=/opt/qnn
+Finish the running pre_gen_pte from /workspaces/tman/models/Qwen3-1.7B-GPTQ-Int4/qwen_qnn

@@ -1,0 +1,47 @@
+# System files
+.DS_Store
+
+# Python environment and cache
+.hypothesis
+.mypy_cache/
+.venv/
+__pycache__/
+
+# Build and tool-generated files
+aar-out/
+arm_test/
+buck-out/
+buck2-bin/
+build/
+build-android/
+build-x86/
+cmake-android-out/
+cmake-ios-out/
+cmake-out*
+cmake-out-android/
+dist/
+ethos-u-scratch/
+executorch.egg-info
+pip-out/
+pcre2/
+
+# Any exported models and profiling outputs
+*.bin
+*.model
+*.pte
+!test_bpe_tokenizer.bin
+!test_tiktoken_tokenizer.model
+*.log
+
+# Editor temporaries
+*.idea
+*.sw[a-z]
+*~
+.~lock.*
+
+# Xcode
+xcuserdata/
+.build/
+.swiftpm/
+*.xcworkspace/
+*.xcframework/
