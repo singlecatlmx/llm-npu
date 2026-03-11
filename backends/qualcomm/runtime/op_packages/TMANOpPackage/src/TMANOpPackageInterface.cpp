@@ -15,29 +15,30 @@
 DEFINE_UNIQ_TY()
 BEGIN_PKG_OPS_OPTS_LIST()
 
-/** Note that the order of declarations given here defines the order in which ops and graph optimizations are
- *  registered to the HTP Core.
- *  Append the latest OpName at the bottom
+/** Note that the order of declarations given here defines the order in which
+ * ops and graph optimizations are registered to the HTP Core. Append the latest
+ * OpName at the bottom
  */
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANPrecompute)
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANLinear)
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANFinalize)
+DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANAdd)
 
 END_PKG_OPS_OPTS_LIST()
 
 // op package info
-static constexpr auto sg_packageName = THIS_PKG_NAME_STR;  // package name passed in as compile flag
+static constexpr auto sg_packageName =
+    THIS_PKG_NAME_STR; // package name passed in as compile flag
 
-static std::array<const char*, 3> sg_opNames{{"TMANLinear",
-                                              "TMANFinalize",
-                                              "TMANPrecompute"}};
+static std::array<const char*, 4> sg_opNames{
+    {"TMANLinear", "TMANFinalize", "TMANPrecompute", "TMANAdd"}};
 
-static Qnn_ApiVersion_t sg_sdkApiVersion  = QNN_HTP_API_VERSION_INIT;
+static Qnn_ApiVersion_t sg_sdkApiVersion = QNN_HTP_API_VERSION_INIT;
 static QnnOpPackage_Info_t sg_packageInfo = QNN_OP_PACKAGE_INFO_INIT;
 
 // global data
 static QnnOpPackage_GlobalInfrastructure_t sg_globalInfra =
-nullptr;  // global infrastructure not in use for now
+    nullptr; // global infrastructure not in use for now
 static bool sg_packageInitialized = false;
 
 /*
@@ -52,33 +53,33 @@ static bool sg_packageInitialized = false;
  *
  * for cross rpc versions, skel side user provided logging call back function
  * can be defined as part of op packages. maximal log level sg_maxLogLevel
- * can be set by Qnn_ErrorHandle_t TMANOpPackageLogSetLevel(QnnLog_Level_t maxLogLevel)
+ * can be set by Qnn_ErrorHandle_t TMANOpPackageLogSetLevel(QnnLog_Level_t
+ * maxLogLevel)
  */
 /*
  * for alternative logging method provided by HTP core, please refer to log.h
  */
 static QnnLog_Callback_t sg_logCallback =
-    nullptr;  // user provided call back function pointer for logging
+    nullptr; // user provided call back function pointer for logging
 static QnnLog_Level_t sg_maxLogLevel =
-    (QnnLog_Level_t)0;  // maximal log level used in user provided logging
+    (QnnLog_Level_t)0; // maximal log level used in user provided logging
 static bool sg_logInitialized =
-    false;  // tracks whether user provided logging method has been initialized
-
+    false; // tracks whether user provided logging method has been initialized
 
 /*
-* op initialization
-* needs to be global in the package
-* one initialization per package before any op definitions
-* syntax: INIT_PACKAGE_OP_DEF()
-*/
+ * op initialization
+ * needs to be global in the package
+ * one initialization per package before any op definitions
+ * syntax: INIT_PACKAGE_OP_DEF()
+ */
 INIT_PACKAGE_OP_DEF()
 
 /*
-* optimization initialization
-* needs to be global in the package
-* one initialization per package before any optimization definitions
-* syntax: INIT_PACKAGE_OPTIMIZATION_DEF()
-*/
+ * optimization initialization
+ * needs to be global in the package
+ * one initialization per package before any optimization definitions
+ * syntax: INIT_PACKAGE_OPTIMIZATION_DEF()
+ */
 INIT_PACKAGE_OPTIMIZATION_DEF()
 
 /*
@@ -118,7 +119,8 @@ INIT_PACKAGE_PARAM_ORDER_DEF()
  * then:
  *   HTP backend will pass to op implementation function the following:
  *     output(s), input(s), parameter(s),
- *     outputPerChannelScale(s), inputPerChannelScale(s), paramPerChannelScale(s)
+ *     outputPerChannelScale(s), inputPerChannelScale(s),
+ * paramPerChannelScale(s)
  *
  * optimization rules can be used to remove extra perChannelScale tensors
  *
@@ -129,160 +131,178 @@ INIT_PACKAGE_PARAM_ORDER_DEF()
 // LIST_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
 
 /*
-* Declare and define the special intialize function for HTP Backend to load
-*/
+ * Declare and define the special intialize function for HTP Backend to load
+ */
 INIT_PKG_CORE_INIT_FUNC()
 
 /* op package API's */
 
-Qnn_ErrorHandle_t TMANOpPackageInit(QnnOpPackage_GlobalInfrastructure_t infrastructure) {
-    if (sg_packageInitialized) return QNN_OP_PACKAGE_ERROR_LIBRARY_ALREADY_INITIALIZED;
+Qnn_ErrorHandle_t TMANOpPackageInit(
+    QnnOpPackage_GlobalInfrastructure_t infrastructure) {
+  if (sg_packageInitialized)
+    return QNN_OP_PACKAGE_ERROR_LIBRARY_ALREADY_INITIALIZED;
 
-    /*
-    * op parameter order registration
-    * registers all defined op parameter orders in the package
-    * syntax: REGISTER_PACKAGE_PARAM_ORDERS()
-    */
-    REGISTER_PACKAGE_PARAM_ORDERS()
+  /*
+   * op parameter order registration
+   * registers all defined op parameter orders in the package
+   * syntax: REGISTER_PACKAGE_PARAM_ORDERS()
+   */
+  REGISTER_PACKAGE_PARAM_ORDERS()
 
-    /*
-    * op axis parameter name registration
-    * registers all axis parameter names in the package
-    * used with LIST_PACKAGE_AXIS_PARAMS(...)
-    * syntax: REGISTER_PACKAGE_AXIS_PARAMS()
-    */
-    REGISTER_PACKAGE_AXIS_PARAMS()
+  /*
+   * op axis parameter name registration
+   * registers all axis parameter names in the package
+   * used with LIST_PACKAGE_AXIS_PARAMS(...)
+   * syntax: REGISTER_PACKAGE_AXIS_PARAMS()
+   */
+  REGISTER_PACKAGE_AXIS_PARAMS()
 
-    /*
-    * per-channel scale op name registration
-    * registers all per-channel scale op names in the package
-    * used with LIST_PACKAGE_PER_CHANNEL_QUANTIZED_OPS(...)
-    * syntax: REGISTER_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
-    */
-    REGISTER_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
+  /*
+   * per-channel scale op name registration
+   * registers all per-channel scale op names in the package
+   * used with LIST_PACKAGE_PER_CHANNEL_QUANTIZED_OPS(...)
+   * syntax: REGISTER_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
+   */
+  REGISTER_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
 
-    sg_globalInfra        = infrastructure;
-    sg_packageInitialized = true;
-    return QNN_SUCCESS;
+  sg_globalInfra = infrastructure;
+  sg_packageInitialized = true;
+  return QNN_SUCCESS;
 }
 
 Qnn_ErrorHandle_t TMANOpPackageGetInfo(const QnnOpPackage_Info_t** info) {
-    if (!sg_packageInitialized) return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
-    if (!info) return QNN_OP_PACKAGE_ERROR_INVALID_INFO;
+  if (!sg_packageInitialized)
+    return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
+  if (!info)
+    return QNN_OP_PACKAGE_ERROR_INVALID_INFO;
 
-    sg_packageInfo                = QNN_OP_PACKAGE_INFO_INIT;
-    sg_packageInfo.packageName    = sg_packageName;
-    sg_packageInfo.operationNames = sg_opNames.data();
-    sg_packageInfo.numOperations  = sg_opNames.size();
-    sg_packageInfo.sdkBuildId     = QNN_SDK_BUILD_ID;
-    sg_packageInfo.sdkApiVersion  = &sg_sdkApiVersion;
+  sg_packageInfo = QNN_OP_PACKAGE_INFO_INIT;
+  sg_packageInfo.packageName = sg_packageName;
+  sg_packageInfo.operationNames = sg_opNames.data();
+  sg_packageInfo.numOperations = sg_opNames.size();
+  sg_packageInfo.sdkBuildId = QNN_SDK_BUILD_ID;
+  sg_packageInfo.sdkApiVersion = &sg_sdkApiVersion;
 
-    *info = &sg_packageInfo;
-    return QNN_SUCCESS;
+  *info = &sg_packageInfo;
+  return QNN_SUCCESS;
 }
 
-Qnn_ErrorHandle_t TMANOpPackageLogInitialize(QnnLog_Callback_t callback, QnnLog_Level_t maxLogLevel) {
-    if (sg_logInitialized) return QNN_OP_PACKAGE_ERROR_LIBRARY_ALREADY_INITIALIZED;
-    if (!callback) return QNN_LOG_ERROR_INVALID_ARGUMENT;
-    if (maxLogLevel < QNN_LOG_LEVEL_ERROR) return QNN_LOG_ERROR_INVALID_ARGUMENT;
-    sg_logCallback    = callback;
-    sg_maxLogLevel    = maxLogLevel;
-    sg_logInitialized = true;
-    return QNN_SUCCESS;
+Qnn_ErrorHandle_t TMANOpPackageLogInitialize(
+    QnnLog_Callback_t callback,
+    QnnLog_Level_t maxLogLevel) {
+  if (sg_logInitialized)
+    return QNN_OP_PACKAGE_ERROR_LIBRARY_ALREADY_INITIALIZED;
+  if (!callback)
+    return QNN_LOG_ERROR_INVALID_ARGUMENT;
+  if (maxLogLevel < QNN_LOG_LEVEL_ERROR)
+    return QNN_LOG_ERROR_INVALID_ARGUMENT;
+  sg_logCallback = callback;
+  sg_maxLogLevel = maxLogLevel;
+  sg_logInitialized = true;
+  return QNN_SUCCESS;
 }
 
 Qnn_ErrorHandle_t TMANOpPackageLogSetLevel(QnnLog_Level_t maxLogLevel) {
-    if (maxLogLevel < QNN_LOG_LEVEL_ERROR) return QNN_LOG_ERROR_INVALID_ARGUMENT;
-    sg_maxLogLevel = maxLogLevel;
-    return QNN_SUCCESS;
+  if (maxLogLevel < QNN_LOG_LEVEL_ERROR)
+    return QNN_LOG_ERROR_INVALID_ARGUMENT;
+  sg_maxLogLevel = maxLogLevel;
+  return QNN_SUCCESS;
 }
 
 Qnn_ErrorHandle_t TMANOpPackageLogTerminate() {
-    if (!sg_logInitialized) return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
-    sg_logCallback    = nullptr;
-    sg_maxLogLevel    = (QnnLog_Level_t)0;
-    sg_logInitialized = false;
-    return QNN_SUCCESS;
+  if (!sg_logInitialized)
+    return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
+  sg_logCallback = nullptr;
+  sg_maxLogLevel = (QnnLog_Level_t)0;
+  sg_logInitialized = false;
+  return QNN_SUCCESS;
 }
 
-Qnn_ErrorHandle_t TMANOpPackageValidateOpConfig (Qnn_OpConfig_t opConfig){
-    if (std::string(sg_packageName) != opConfig.v1.packageName) {
-        return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
+Qnn_ErrorHandle_t TMANOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
+  if (std::string(sg_packageName) != opConfig.v1.packageName) {
+    return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  }
 
-    /* auto-generated validation code below
-     * Check if op config type matches any registered ops
-     * If a match is found, check number of inputs, outputs and params
-     */
-    if (std::string(opConfig.v1.typeName) == "TMANLinear"){
-        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 3 || opConfig.v1.numOfOutputs != 1){
-          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-        }
+  /* auto-generated validation code below
+   * Check if op config type matches any registered ops
+   * If a match is found, check number of inputs, outputs and params
+   */
+  if (std::string(opConfig.v1.typeName) == "TMANLinear") {
+    if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 3 ||
+        opConfig.v1.numOfOutputs != 1) {
+      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
-    else if (std::string(opConfig.v1.typeName) == "TMANFinalize"){
-        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 || opConfig.v1.numOfOutputs != 1){
-          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-        }
+  } else if (std::string(opConfig.v1.typeName) == "TMANFinalize") {
+    if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 ||
+        opConfig.v1.numOfOutputs != 1) {
+      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
-    else if (std::string(opConfig.v1.typeName) == "TMANPrecompute"){
-        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 || opConfig.v1.numOfOutputs != 1){
-          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-        }
+  } else if (std::string(opConfig.v1.typeName) == "TMANPrecompute") {
+    if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 ||
+        opConfig.v1.numOfOutputs != 1) {
+      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
-    else{
-        return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  } else if (std::string(opConfig.v1.typeName) == "TMANAdd") {
+    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 2 ||
+        opConfig.v1.numOfOutputs != 1) {
+      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
+  } else {
+    return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  }
 
-    /*
-    * additional validation code here
-    * */
+  /*
+   * additional validation code here
+   * */
 
-    return QNN_SUCCESS;
+  return QNN_SUCCESS;
 }
 
-/* The following three functions in this comment are not called by HTP backend for now,
- * no auto-generated implementations are created. Users should see example for full function signatures.
- * (version 1.3.0) Qnn_ErrorHandle_t TMANOpPackageCreateKernels (QnnOpPackage_GraphInfrastructure_t
- * graphInfrastructure, QnnOpPackage_Node_t node, QnnOpPackage_Kernel_t** kernels, uint32_t*
- * numKernels)
- * (version 1.3.0) Qnn_ErrorHandle_t TMANOpPackageFreeKernels (QnnOpPackage_Kernel_t* kernels)
+/* The following three functions in this comment are not called by HTP backend
+ * for now, no auto-generated implementations are created. Users should see
+ * example for full function signatures. (version 1.3.0) Qnn_ErrorHandle_t
+ * TMANOpPackageCreateKernels (QnnOpPackage_GraphInfrastructure_t
+ * graphInfrastructure, QnnOpPackage_Node_t node, QnnOpPackage_Kernel_t**
+ * kernels, uint32_t* numKernels) (version 1.3.0) Qnn_ErrorHandle_t
+ * TMANOpPackageFreeKernels (QnnOpPackage_Kernel_t* kernels)
  *
- * (version 1.4.0) Qnn_ErrorHandle_t TMANOpPackageCreateOpImpl (QnnOpPackage_GraphInfrastructure_t
- * graphInfrastructure, QnnOpPackage_Node_t node, QnnOpPackage_OpImpl_t* opImpl)
- *(version 1.4.0) Qnn_ErrorHandle_t TMANOpPackageFreeOpImpl (QnnOpPackage_OpImpl_t opImpl)
+ * (version 1.4.0) Qnn_ErrorHandle_t TMANOpPackageCreateOpImpl
+ * (QnnOpPackage_GraphInfrastructure_t graphInfrastructure, QnnOpPackage_Node_t
+ * node, QnnOpPackage_OpImpl_t* opImpl) (version 1.4.0) Qnn_ErrorHandle_t
+ * TMANOpPackageFreeOpImpl (QnnOpPackage_OpImpl_t opImpl)
  */
 
 Qnn_ErrorHandle_t TMANOpPackageTerminate() {
-if (!sg_packageInitialized) return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
+  if (!sg_packageInitialized)
+    return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
 
-sg_globalInfra        = nullptr;
-sg_packageInitialized = false;
-return QNN_SUCCESS;
+  sg_globalInfra = nullptr;
+  sg_packageInitialized = false;
+  return QNN_SUCCESS;
 }
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-
 /* latest version */
-Qnn_ErrorHandle_t TMANOpPackageInterfaceProvider(QnnOpPackage_Interface_t* interface) {
-  if (!interface) return QNN_OP_PACKAGE_ERROR_INVALID_ARGUMENT;
-  interface->interfaceVersion      = {1, 4, 0};
-  interface->v1_4.init             = TMANOpPackageInit;
-  interface->v1_4.terminate        = TMANOpPackageTerminate;
-  interface->v1_4.getInfo          = TMANOpPackageGetInfo;
+Qnn_ErrorHandle_t TMANOpPackageInterfaceProvider(
+    QnnOpPackage_Interface_t* interface) {
+  if (!interface)
+    return QNN_OP_PACKAGE_ERROR_INVALID_ARGUMENT;
+  interface->interfaceVersion = {1, 4, 0};
+  interface->v1_4.init = TMANOpPackageInit;
+  interface->v1_4.terminate = TMANOpPackageTerminate;
+  interface->v1_4.getInfo = TMANOpPackageGetInfo;
   interface->v1_4.validateOpConfig = TMANOpPackageValidateOpConfig;
-  interface->v1_4.createOpImpl     = nullptr;
-  interface->v1_4.freeOpImpl       = nullptr;
-  interface->v1_4.logInitialize    = TMANOpPackageLogInitialize;
-  interface->v1_4.logSetLevel      = TMANOpPackageLogSetLevel;
-  interface->v1_4.logTerminate     = TMANOpPackageLogTerminate;
+  interface->v1_4.createOpImpl = nullptr;
+  interface->v1_4.freeOpImpl = nullptr;
+  interface->v1_4.logInitialize = TMANOpPackageLogInitialize;
+  interface->v1_4.logSetLevel = TMANOpPackageLogSetLevel;
+  interface->v1_4.logTerminate = TMANOpPackageLogTerminate;
   return QNN_SUCCESS;
 }
 
 #ifdef __cplusplus
 }
 #endif
-
-

@@ -45,3 +45,5 @@ xcuserdata/
 .swiftpm/
 *.xcworkspace/
 *.xcframework/
+
+.vscode/

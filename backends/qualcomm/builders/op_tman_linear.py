@@ -4,27 +4,30 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import cast, Dict, List
+import logging
+from typing import Dict, List, cast
 
 import executorch.backends.qualcomm.python.PyQnnWrapperAdaptor as PyQnnWrapper
-
 import numpy as np
 import torch
+
+from executorch.backends.qualcomm.builders.utils import (
+    hvx_preprocess_weights,
+    unpack_gptqv2,
+    unpack_weights,
+)
 from executorch.backends.qualcomm.utils.constants import QCOM_DATA
-from executorch.backends.qualcomm.builders.utils import unpack_gptqv2, hvx_preprocess_weights, unpack_weights
-import logging
 
 from .node_visitor import NodeVisitor, register_node_visitor
 from .qnn_constants import (
+    QNN_OP_PACKAGE_NAME_QTI_AISW,
+    QNN_OP_PACKAGE_NAME_TMAN,
+    OpConvert,
+    OpTMANFinalize,
     OpTMANLinear,
     OpTMANPrecompute,
-    OpTMANFinalize,
-    OpConvert,
-    QNN_OP_PACKAGE_NAME_TMAN,
-    QNN_OP_PACKAGE_NAME_QTI_AISW,
 )
 from .utils import get_parameter
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -77,7 +80,9 @@ def _decide_tile_size(
             success = True
             break
     if not success:
-        logger.warning(f"Can't find optimal tile size that is multiple of {divider} and fits in VTCM, use {res} as workaround")
+        logger.warning(
+            f"Can't find optimal tile size that is multiple of {divider} and fits in VTCM, use {res} as workaround"
+        )
     return res
 
 
@@ -116,15 +121,24 @@ class TMANLinear(NodeVisitor):
             symmetric = cast(bool, node.args[9])
             gptq_v2 = cast(bool, node.args[10])
 
-            qweight_repacked, scales_repacked, zeros_repacked, ref_bits, ref_group_size, ref_symmetric = unpack_gptqv2(
+            (
+                qweight_repacked,
+                scales_repacked,
+                zeros_repacked,
+                ref_bits,
+                ref_group_size,
+                ref_symmetric,
+            ) = unpack_gptqv2(
                 qweight_tensor.detach().numpy(),
                 scales_tensor.detach().numpy(),
                 qzeros_tensor.detach().numpy(),
                 gptq_v2,
             )
-            assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
-                f"TMANLinear: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
-            )
+            assert (
+                ref_bits == bits
+                and ref_group_size == group_size
+                and ref_symmetric == symmetric
+            ), f"TMANLinear: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
         elif node.target.__name__ == "tman.bitnet_linear.default":
             qweight_node = node.args[1]
             qweight_tensor = get_parameter(qweight_node, self.edge_program)
@@ -134,11 +148,17 @@ class TMANLinear(NodeVisitor):
             bits = 2
             symmetric = True
 
-            qweight_repacked = (unpack_weights(qweight_tensor.detach(), dtype=torch.int8) + 2).to(torch.uint8).numpy()
+            qweight_repacked = (
+                (unpack_weights(qweight_tensor.detach(), dtype=torch.int8) + 2)
+                .to(torch.uint8)
+                .numpy()
+            )
             scales_repacked = scales_tensor.detach().numpy()
             zeros_repacked = None
         else:
-            raise NotImplementedError(f"Unsupported node target: {node.target.__name__}")
+            raise NotImplementedError(
+                f"Unsupported node target: {node.target.__name__}"
+            )
 
         output_tensor = self.get_tensor(node, node)
         output_tensor_wrapper = self.define_tensor(
@@ -154,10 +174,26 @@ class TMANLinear(NodeVisitor):
 
         zeros_repacked = zeros_repacked if not symmetric else None
         vec_p = 128
-        total_size = qweight_repacked.nbytes + max((scales_repacked.size + (zeros_repacked.size if zeros_repacked is not None else 0)) * np.dtype("float16").itemsize, 128)
-        tile_p = _decide_tile_size(m*bits, total_size, divider=bits*vec_p)
-        qweight_repacked, scales_repacked = hvx_preprocess_weights(qweight_repacked, scales_repacked, zeros_repacked, bits, tile_p=tile_p, vec_p=vec_p)
-        logger.info(f"TMANLinear: m={m}, k={k}, bits={bits}, tile_p={tile_p}, qweight({qweight_repacked.shape})")
+        total_size = qweight_repacked.nbytes + max(
+            (
+                scales_repacked.size
+                + (zeros_repacked.size if zeros_repacked is not None else 0)
+            )
+            * np.dtype("float16").itemsize,
+            128,
+        )
+        tile_p = _decide_tile_size(m * bits, total_size, divider=bits * vec_p)
+        qweight_repacked, scales_repacked = hvx_preprocess_weights(
+            qweight_repacked,
+            scales_repacked,
+            zeros_repacked,
+            bits,
+            tile_p=tile_p,
+            vec_p=vec_p,
+        )
+        logger.info(
+            f"TMANLinear: m={m}, k={k}, bits={bits}, tile_p={tile_p}, qweight({qweight_repacked.shape})"
+        )
 
         qweight_tensor_wrapper = self.define_tensor(
             qweight_node,
@@ -216,7 +252,7 @@ class TMANLinear(NodeVisitor):
                 nodes_to_wrappers=nodes_to_wrappers,
             )
             intermediate_output_tensor_wrapper = self.define_custom_tensor_wrapper(
-                node_name=node.name + "_output_converted",
+                node_name=node.name,
                 tensor_type=PyQnnWrapper.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
                 dtype=PyQnnWrapper.Qnn_DataType_t.QNN_DATATYPE_FLOAT_16,
                 quant_encoding=no_quant_encoding,
@@ -225,6 +261,7 @@ class TMANLinear(NodeVisitor):
                 tensor=None,
                 is_fake_tensor=True,
                 nodes_to_wrappers=nodes_to_wrappers,
+                wrapper_idx=1,
             )
             input_convert_op = PyQnnWrapper.PyQnnOpWrapper(
                 node.name + "_input_convert",
@@ -273,7 +310,9 @@ class TMANLinear(NodeVisitor):
             QNN_OP_PACKAGE_NAME_TMAN,
             OpTMANLinear.op_name,
         )
-        linear_op.AddInputTensors([l_tensor_wrapper, qweight_tensor_wrapper, scales_tensor_wrapper])
+        linear_op.AddInputTensors(
+            [l_tensor_wrapper, qweight_tensor_wrapper, scales_tensor_wrapper]
+        )
         linear_op.AddOutputTensors([c_tensor_wrapper])
         linear_op.AddScalarParam(
             OpTMANLinear.param_group_size,
@@ -315,5 +354,11 @@ class TMANLinear(NodeVisitor):
         )
 
         if self.add_convert:
-            return [input_convert_op, precompute_op, linear_op, finalize_op, output_convert_op]
+            return [
+                input_convert_op,
+                precompute_op,
+                linear_op,
+                finalize_op,
+                output_convert_op,
+            ]
         return [precompute_op, linear_op, finalize_op]

@@ -536,3 +536,8 @@ class OpTMANFinalize:
     param_group_size: str = "group_size"
     param_bits: str = "bits"
     param_symmetric: str = "symmetric"
+
+
+@dataclass(init=False, frozen=True)
+class OpTMANAdd:
+    op_name: str = "TMANAdd"
