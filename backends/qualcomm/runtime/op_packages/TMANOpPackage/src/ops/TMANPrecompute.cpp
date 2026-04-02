@@ -71,16 +71,47 @@ GraphStatus tmanprecomputeImpl(TensorType& l,
   const int32_t gemm_n = x.dims()[2];
 
   const int32_t group_size = ((const int32_t*)t_group_size.raw_data_const())[0];
+  const int32_t bits        = ((const int32_t*)t_bits.raw_data_const())[0];
   const bool zero_point    = ((const int32_t*)t_symmetric.raw_data_const())[0] == 0;
+  const DType x_dtype      = x.get_dtype();
 
   const int32_t l_size  = gemm_k / LUT_G * LUT_SIZE;
   const int32_t real_act_group_size = (group_size == 0) ? -1 : ACT_GROUP_SIZE;
   const int32_t ls_size = (real_act_group_size == -1) ? 1 : (gemm_k / real_act_group_size);
+  const int32_t ls_reserved = MAX(ls_size, 128 / sizeof(float));
+  const int32_t lb_reserved = MAX((group_size == 0) ? 1 : (gemm_k / group_size), 128 / sizeof(float));
 
-  const XType* x_ptr = (const XType*)x.raw_data_const();
   LType* l_ptr = (LType*)l.raw_data();
   float* ls_ptr = (float*)(l_ptr + l_size);
-  float* lb_ptr = ls_ptr + MAX(ls_size, 128 / sizeof(float));
+  float* lb_ptr = ls_ptr + ls_reserved;
+
+  if (tman_is_q8_dtype(x_dtype))
+  {
+    // W4A8 新路径：
+    // - 输入直接是 q8 激活
+    // - 只支持当前目标配置：W4 + group-wise weight
+    // - 输出 scratch 仍然复用旧版 l/ls/lb 布局
+    if (bits != 4 || group_size <= 0)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+
+    // 先清零 scratch 末尾区域，避免后续读取残留数据。
+    std::memset(ls_ptr, 0, sizeof(float) * (ls_reserved + lb_reserved));
+    if (tman_w4a8_precompute_from_q8(gemm_k, x_dtype, x.raw_data_const(), l_ptr, ls_ptr, lb_ptr) != 0)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+    return GraphStatus::Success;
+  }
+
+  // 旧路径保持原状，只接受 Float16 输入。
+  if (x_dtype != DType::Float16)
+  {
+    return GraphStatus::ErrorDimensions;
+  }
+
+  const XType* x_ptr = (const XType*)x.raw_data_const();
 
   if (zero_point && group_size == 64)  // w2g64, symmetric=False
   {

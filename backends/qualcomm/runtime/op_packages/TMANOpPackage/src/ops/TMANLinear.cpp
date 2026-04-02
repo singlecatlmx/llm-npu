@@ -136,15 +136,54 @@ GraphStatus tmanlinearImpl(TensorType& c,
 
   const int32_t l_size  = gemm_k / LUT_G * LUT_SIZE;
   const int32_t ls_size = (ACT_GROUP_SIZE == -1) ? 1 : (gemm_k / ACT_GROUP_SIZE);
+  const int32_t ls_reserved = MAX(ls_size, 128 / sizeof(float));
 
   const LType* l_ptr  = (const LType*)l.raw_data_const();
   const float* ls_ptr = (const float*)(l_ptr + l_size);
-  const float* lb_ptr = ls_ptr + MAX(ls_size, 128 / sizeof(float));
+  const float* lb_ptr = ls_ptr + ls_reserved;
 
   const uint8_t* w_ptr = (const uint8_t*)qweight.raw_data_const();
   const XType* s_ptr   = (const XType*)scales.raw_data_const();
   CType* c_ptr         = (CType*)c.raw_data();
+  const int32_t c_elements = c.total_storage_bytes() / sizeof(int32_t);
 
+  if (bits == TMAN_W4A8_BITS && ls_ptr[0] == TMAN_W4A8_SENTINEL)
+  {
+    // 看到 sentinel，说明上游 Precompute 已经走了 W4A8 新路径。
+    // 此时不再进入旧的 hvx_tbl(float 累加) 实现，而是改走新的
+    // int32 主路径。
+    const int32_t p_tiles = qweight.dims()[2];
+    if (p_tiles <= 0) return GraphStatus::ErrorDimensions;
+
+    // qweight 在 builder 侧已经按 tile_p 预处理过。
+    // 这里根据 qweight 第二维 tile 数反推出实际 tile_p。
+    const int32_t tile_p = (gemm_m * bits) / p_tiles;
+    if (tile_p <= 0 || (gemm_m * bits) % p_tiles != 0)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+
+    // 新路径直接把“输出 q-domain 的 int32”写入 c。
+    if (tman_w4a8_linear_from_lut(
+            gemm_m,
+            gemm_k,
+            group_size,
+            zero_point,
+            bits,
+            tile_p,
+            l_ptr,
+            w_ptr,
+            s_ptr,
+            reinterpret_cast<int32_t *>(c.raw_data()),
+            c_elements) != 0)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+
+    return GraphStatus::Success;
+  }
+
+  // 下面全部是旧的 W4A16 / BitNet 路径，保持不变。
   if (zero_point && bits == 2 && group_size == 64)  // w2g64, symmetric=False
   {
     hvx_tbl<LType, XType, CType, ACT_GROUP_SIZE, 64, true, 2, TILE_K, LUT_G, true>(gemm_m, gemm_k, gemm_n, l_ptr, ls_ptr, lb_ptr, w_ptr, s_ptr, c_ptr);

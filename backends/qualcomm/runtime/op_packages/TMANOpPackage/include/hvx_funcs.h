@@ -7,7 +7,12 @@
 #include "QnnOpPackage.h"
 #include "HTP/core/simple_reg.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <hexagon_types.h>
+#include <limits>
 #include <type_traits>
 
 #define UNUSED(x) (void)(x)
@@ -51,6 +56,401 @@ static HVX_INLINE_ALWAYS void l2fetch(const void *p, uint32_t stride,
 }
 
 #endif /* _HVX_INTERNAL_H */
+
+// -----------------------------------------------------------------------------
+// W4A8 整数主路径的总体约定
+//
+// 1. 该路径只处理 8bit 量化激活输入，输入 dtype 允许为：
+//    - QInt8  : 有符号 int8 存储
+//    - QUInt8 : 无符号 uint8 存储，内部会先减去 128 再进入计算
+//
+// 2. 当前这一版 kernel 不额外接收激活 per-channel scale 张量。
+//    约定上游 builder/预处理阶段已经把：
+//    - 激活 per-channel 对称 scale
+//    - 权重 group scale
+//    - 输出 requant scale
+//    折叠进了预处理后的 `scales` 张量中。
+//
+// 3. 为了在不修改旧 scratch buffer 布局的前提下接入新路径：
+//    - Precompute 在 ls[0] 写入 sentinel，告诉后续这是 W4A8 路径
+//    - Linear 在 c 尾部写入 magic，告诉 Finalize 当前 c 中保存的是
+//      “已经处于输出 q-domain 的 int32 中间结果”
+//
+// 4. 这样设计的目标是：
+//    - 保留原有 W4A16(fp16 内部路径) 不受影响
+//    - 先把 W4A8 的整数主路径在 kernel 侧打通
+//    - 后续 builder 只需要按约定把数据喂进来即可
+// -----------------------------------------------------------------------------
+static constexpr float TMAN_W4A8_SENTINEL = -1.0f;
+static constexpr int32_t TMAN_W4A8_MAGIC0 = 0x544D414E;  // "TMAN"
+static constexpr int32_t TMAN_W4A8_MAGIC1 = 0x57344138;  // "W4A8"
+static constexpr int32_t TMAN_W4A8_SCALE_FRAC_BITS = 20;
+static constexpr int32_t TMAN_W4A8_BITS = 4;
+static constexpr int32_t TMAN_W4A8_G = 4;
+static constexpr int32_t TMAN_W4A8_LUT_SIZE = 16;
+static constexpr int32_t TMAN_W4A8_TILE_Q = 64;
+static constexpr int32_t TMAN_W4A8_VEC_P = 128;
+static constexpr int32_t TMAN_W4A8_VEC_Q = 4;
+
+static inline bool tman_is_q8_dtype(DType dtype)
+{
+  // 仅把 QInt8 / QUInt8 视为 W4A8 新路径的输入/输出类型。
+  return dtype == DType::QInt8 || dtype == DType::QUInt8;
+}
+
+static inline int32_t tman_clamp_int32(int64_t value)
+{
+  if (value > std::numeric_limits<int32_t>::max()) return std::numeric_limits<int32_t>::max();
+  if (value < std::numeric_limits<int32_t>::min()) return std::numeric_limits<int32_t>::min();
+  return static_cast<int32_t>(value);
+}
+
+static inline int16_t tman_clamp_int16(int32_t value)
+{
+  if (value > std::numeric_limits<int16_t>::max()) return std::numeric_limits<int16_t>::max();
+  if (value < std::numeric_limits<int16_t>::min()) return std::numeric_limits<int16_t>::min();
+  return static_cast<int16_t>(value);
+}
+
+static inline int32_t tman_centered_q8_value(const void *data, DType dtype, int32_t index)
+{
+  // W4A8 主路径内部统一使用“以 0 为中心”的激活值：
+  // - QUInt8: 需要减去存储零点 128
+  // - QInt8 : 直接读取
+  if (dtype == DType::QUInt8)
+  {
+    const uint8_t *u8 = reinterpret_cast<const uint8_t *>(data);
+    return static_cast<int32_t>(u8[index]) - 128;
+  }
+
+  const int8_t *s8 = reinterpret_cast<const int8_t *>(data);
+  return static_cast<int32_t>(s8[index]);
+}
+
+static inline int32_t tman_q8_storage_zero_point(DType dtype)
+{
+  // Finalize 回写时需要恢复到存储域。
+  return dtype == DType::QUInt8 ? 128 : 0;
+}
+
+static inline int32_t tman_apply_fixed_point_scale(int32_t value, float scale)
+{
+  // 这里使用一个简单的定点乘法近似，把 float scale 转成
+  // Q(TMAN_W4A8_SCALE_FRAC_BITS) 定点乘数，再做带符号 rounding shift。
+  //
+  // 注意：
+  // - 这不是最终性能/精度最优实现
+  // - 但可以先把“整数主路径”打通，便于后续继续优化
+  const int64_t multiplier = static_cast<int64_t>(std::llround(static_cast<double>(scale) * (1LL << TMAN_W4A8_SCALE_FRAC_BITS)));
+  const int64_t product = static_cast<int64_t>(value) * multiplier;
+  const int64_t rounding = (product >= 0) ? (1LL << (TMAN_W4A8_SCALE_FRAC_BITS - 1))
+                                          : -(1LL << (TMAN_W4A8_SCALE_FRAC_BITS - 1));
+  return tman_clamp_int32((product + rounding) >> TMAN_W4A8_SCALE_FRAC_BITS);
+}
+
+static inline int32_t tman_w4a8_local_p(int32_t bit, int32_t m_in_vec)
+{
+  // 该函数把 “输出通道内的 bit-plane 索引” 映射回 hvx_preprocess_weights
+  // 打包后的 tile_p 局部布局。
+  //
+  // 这是通过对 Python 侧 hvx_preprocess_weights 的 reshape/transpose
+  // 过程做逆向推导得到的，用来确保 kernel 能正确读取已经预处理好的
+  // qweight 字节流，而不需要改动 builder 的现有打包格式。
+  const int32_t r3 = m_in_vec % 32;
+  const int32_t t = m_in_vec / 32;
+  const int32_t r2 = t % 2;
+  const int32_t r1 = t / 2;
+  return bit * TMAN_W4A8_VEC_P + r2 * 64 + r3 * 2 + r1;
+}
+
+static inline uint8_t tman_w4a8_read_packed_index(
+    const uint8_t *w_bytes,
+    int32_t gemm_m,
+    int32_t gemm_k,
+    int32_t bits,
+    int32_t tile_p,
+    int32_t m,
+    int32_t bit,
+    int32_t q)
+{
+  UNUSED(gemm_m);
+
+  // 读取 builder 预处理后的 qweight 中，某个 (m, bit, q) 位置对应的
+  // 4bit 查表索引。
+  //
+  // 这里返回的是 unsigned 0..15 编码值：
+  // - 对称 4bit 权重时，后面会再减去 8 还原到有符号域
+  // - 非对称 4bit 权重时，后面会减去 group zero-point
+  const int32_t q_tiles = (gemm_k / TMAN_W4A8_G) / TMAN_W4A8_TILE_Q;
+  const int32_t outputs_per_tile = tile_p / bits;
+  const int32_t m_tile = m / outputs_per_tile;
+  const int32_t m_in_tile = m % outputs_per_tile;
+  const int32_t out_block = m_in_tile / TMAN_W4A8_VEC_P;
+  const int32_t m_in_vec = m_in_tile % TMAN_W4A8_VEC_P;
+
+  const int32_t p_in_tile = out_block * bits * TMAN_W4A8_VEC_P + tman_w4a8_local_p(bit, m_in_vec);
+  const int32_t tpv = p_in_tile / TMAN_W4A8_VEC_P;
+  const int32_t pv = p_in_tile % TMAN_W4A8_VEC_P;
+
+  const int32_t q_tile = q / TMAN_W4A8_TILE_Q;
+  const int32_t q_in_tile = q % TMAN_W4A8_TILE_Q;
+  const int32_t tqv = q_in_tile / TMAN_W4A8_VEC_Q;
+  const int32_t pair = (q_in_tile % TMAN_W4A8_VEC_Q) / 2;
+  const int32_t half = (q_in_tile % TMAN_W4A8_VEC_Q) % 2;
+
+  const size_t idx = (((((static_cast<size_t>(m_tile) * q_tiles + q_tile) * (tile_p / TMAN_W4A8_VEC_P) + tpv)
+                      * (TMAN_W4A8_TILE_Q / TMAN_W4A8_VEC_Q) + tqv)
+                      * (TMAN_W4A8_VEC_Q / 2) + pair)
+                      * TMAN_W4A8_VEC_P) + pv;
+
+  const uint8_t packed = w_bytes[idx];
+  return (packed >> (half * TMAN_W4A8_G)) & 0x0F;
+}
+
+static inline float tman_w4a8_read_group_scale(
+    const __fp16 *scales,
+    int32_t gemm_k,
+    int32_t group_size,
+    int32_t bits,
+    int32_t tile_p,
+    int32_t m,
+    int32_t q)
+{
+  // 读取某个 (m, q_group) 对应的 group scale。
+  //
+  // 当前约定这个 scale 已经由上游折叠好了：
+  //   scale ~= act_per_channel_scale * weight_group_scale * output_requant_scale
+  //
+  // 因此 kernel 不再区分这三部分，而是直接把 group_dot 乘上该 scale。
+  const int32_t q_tiles = (gemm_k / TMAN_W4A8_G) / TMAN_W4A8_TILE_Q;
+  const int32_t q_group_size = group_size / TMAN_W4A8_G;
+  const int32_t outputs_per_tile = tile_p / bits;
+  const int32_t out_blocks_per_tile = outputs_per_tile / TMAN_W4A8_VEC_P;
+  const int32_t groups_per_tile = TMAN_W4A8_TILE_Q / q_group_size;
+
+  const int32_t m_tile = m / outputs_per_tile;
+  const int32_t m_in_tile = m % outputs_per_tile;
+  const int32_t out_block = m_in_tile / TMAN_W4A8_VEC_P;
+  const int32_t m_in_vec = m_in_tile % TMAN_W4A8_VEC_P;
+
+  const int32_t q_tile = q / TMAN_W4A8_TILE_Q;
+  const int32_t group_in_tile = (q % TMAN_W4A8_TILE_Q) / q_group_size;
+
+  const size_t idx = (((((static_cast<size_t>(m_tile) * q_tiles + q_tile) * out_blocks_per_tile + out_block)
+                      * groups_per_tile + group_in_tile)
+                      * TMAN_W4A8_VEC_P) + m_in_vec);
+  return static_cast<float>(scales[idx]);
+}
+
+static inline int32_t tman_w4a8_read_zero_unsigned(
+    const __fp16 *scales,
+    int32_t gemm_k,
+    int32_t group_size,
+    int32_t bits,
+    int32_t tile_p,
+    int32_t m,
+    int32_t q)
+{
+  // 非对称 GPTQ 权重会把 zero-point 也一起打包进 scales 张量。
+  // hvx_preprocess_weights 对 zero 做了 (zero * 2 + 1) 的编码，
+  // 这里需要做逆变换还原出 unsigned zero，再转到实际计算所需的域。
+  const int32_t q_tiles = (gemm_k / TMAN_W4A8_G) / TMAN_W4A8_TILE_Q;
+  const int32_t q_group_size = group_size / TMAN_W4A8_G;
+  const int32_t outputs_per_tile = tile_p / bits;
+  const int32_t out_blocks_per_tile = outputs_per_tile / TMAN_W4A8_VEC_P;
+  const int32_t groups_per_tile = TMAN_W4A8_TILE_Q / q_group_size;
+
+  const int32_t m_tile = m / outputs_per_tile;
+  const int32_t m_in_tile = m % outputs_per_tile;
+  const int32_t out_block = m_in_tile / TMAN_W4A8_VEC_P;
+  const int32_t m_in_vec = m_in_tile % TMAN_W4A8_VEC_P;
+
+  const int32_t q_tile = q / TMAN_W4A8_TILE_Q;
+  const int32_t group_in_tile = (q % TMAN_W4A8_TILE_Q) / q_group_size;
+
+  const size_t idx = ((((((static_cast<size_t>(m_tile) * q_tiles + q_tile) * out_blocks_per_tile + out_block)
+                      * groups_per_tile + group_in_tile)
+                      * 2 + 1)
+                      * TMAN_W4A8_VEC_P) + m_in_vec);
+  const float shifted_zero = (static_cast<float>(scales[idx]) - 1.0f) * 0.5f;
+  return static_cast<int32_t>(std::lrintf(shifted_zero + static_cast<float>(1 << (bits - 1))));
+}
+
+static inline int tman_w4a8_precompute_from_q8(
+    int32_t gemm_k,
+    DType x_dtype,
+    const void *x,
+    int16_t *l,
+    float *ls,
+    float *lb)
+{
+  if (!tman_is_q8_dtype(x_dtype) || gemm_k % TMAN_W4A8_G != 0) return -1;
+
+  // 对于 W4A8 路径，Precompute 的职责改为：
+  // - 从 q8 激活直接构造“精确整数 LUT”
+  // - 不再做旧 W4A16 路径中的 fp16 -> int16 近似量化
+  //
+  // LUT 的定义与旧路径保持一致：
+  // 每 4 个激活值组成一组，对应 16 种 +/- 组合。
+  const int32_t q_count = gemm_k / TMAN_W4A8_G;
+  for (int32_t q = 0; q < q_count; ++q)
+  {
+    int32_t xv[TMAN_W4A8_G];
+    for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
+    {
+      xv[ig] = tman_centered_q8_value(x, x_dtype, q * TMAN_W4A8_G + ig);
+    }
+
+    int16_t *lut = l + q * TMAN_W4A8_LUT_SIZE;
+    for (int32_t idx = 0; idx < TMAN_W4A8_LUT_SIZE; ++idx)
+    {
+      // idx 的每一位决定该位置使用 +x 还是 -x。
+      int32_t value = 0;
+      for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
+      {
+        value += ((idx >> ig) & 0x1) ? xv[ig] : -xv[ig];
+      }
+      lut[idx] = tman_clamp_int16(value);
+    }
+  }
+
+  // W4A8 路径不再使用旧实现中的 ls/lb 含义。
+  // 为了复用同一套 scratch buffer，这里只在 ls[0] 写入 sentinel。
+  ls[0] = TMAN_W4A8_SENTINEL;
+  lb[0] = 0.0f;
+  return 0;
+}
+
+static inline int tman_w4a8_linear_from_lut(
+    int32_t gemm_m,
+    int32_t gemm_k,
+    int32_t group_size,
+    bool zero_point,
+    int32_t bits,
+    int32_t tile_p,
+    const int16_t *l,
+    const uint8_t *w_bytes,
+    const __fp16 *scales,
+    int32_t *c,
+    int32_t c_elements)
+{
+  if (bits != TMAN_W4A8_BITS || group_size <= 0) return -1;
+  if (gemm_k % TMAN_W4A8_G != 0 || (gemm_k / TMAN_W4A8_G) % TMAN_W4A8_TILE_Q != 0) return -1;
+  if (group_size % TMAN_W4A8_G != 0 || TMAN_W4A8_TILE_Q % (group_size / TMAN_W4A8_G) != 0) return -1;
+  if (tile_p <= 0 || (tile_p % (bits * TMAN_W4A8_VEC_P)) != 0) return -1;
+  if (c_elements < gemm_m + 2) return -1;
+
+  // 该函数是新的 W4A8 整数主路径核心：
+  // - 输入：int16 LUT + 预处理后的 4bit weight + 折叠后的 scale
+  // - 中间：纯 int32 累加
+  // - 输出：已经处于“最终输出 q-domain”的 int32 值，存放到 c[0:gemm_m]
+  //
+  // 这里的“输出 q-domain”含义是：
+  //   Finalize 只需要做 clamp + 写回 int8/uint8 存储域，
+  //   不再额外进行一次浮点 requant。
+  const int32_t q_group_size = group_size / TMAN_W4A8_G;
+  const int32_t q_count = gemm_k / TMAN_W4A8_G;
+  const int32_t group_count = q_count / q_group_size;
+
+  std::fill(c, c + c_elements, 0);
+
+  for (int32_t m = 0; m < gemm_m; ++m)
+  {
+    int64_t accum = 0;
+    for (int32_t group_idx = 0; group_idx < group_count; ++group_idx)
+    {
+      // 每个 group 都单独读取一份折叠后的 scale。
+      const int32_t q_begin = group_idx * q_group_size;
+      const float scale = tman_w4a8_read_group_scale(scales, gemm_k, group_size, bits, tile_p, m, q_begin);
+      const int32_t zero_unsigned = zero_point
+          ? tman_w4a8_read_zero_unsigned(scales, gemm_k, group_size, bits, tile_p, m, q_begin)
+          : (1 << (bits - 1));
+
+      int32_t group_dot = 0;
+      for (int32_t q = q_begin; q < q_begin + q_group_size; ++q)
+      {
+        const int16_t *lut = l + q * TMAN_W4A8_LUT_SIZE;
+        const int32_t sum_x = static_cast<int32_t>(lut[TMAN_W4A8_LUT_SIZE - 1]);
+
+        // 关键恒等式：
+        // 对 unsigned 4bit 索引 idx 和 LUT 末项 sum_x，有
+        //   dot_unsigned(idx) = (lut[idx] + sum_x) / 2
+        //
+        // 它对应的是“把每一位映射成 0/1 后与 4 个激活求点积”。
+        // 这样可以直接用现有 16 项 LUT 恢复每个 bit-plane 的无符号点积。
+        int32_t dot_unsigned = 0;
+        for (int32_t bit = 0; bit < bits; ++bit)
+        {
+          const uint8_t idx = tman_w4a8_read_packed_index(w_bytes, gemm_m, gemm_k, bits, tile_p, m, bit, q);
+          const int32_t bit_dot = (static_cast<int32_t>(lut[idx]) + sum_x) >> 1;
+          dot_unsigned += bit_dot << bit;
+        }
+
+        // 把 unsigned 编码恢复为真实权值域：
+        // - 对称 4bit: zero_unsigned = 8
+        // - 非对称 4bit: zero_unsigned = group zero-point
+        //
+        // 由于真实权值 = unsigned_value - zero_unsigned，
+        // 所以需要额外减去 zero_unsigned * sum_x。
+        dot_unsigned -= zero_unsigned * sum_x;
+
+        group_dot += dot_unsigned;
+      }
+
+      // group_dot 乘折叠后的 scale，累加到输出通道 m。
+      accum += tman_apply_fixed_point_scale(group_dot, scale);
+    }
+
+    c[m] = tman_clamp_int32(accum);
+  }
+
+  // 在 c 末尾写 magic，供 Finalize 判断当前 c 是否来自 W4A8 整数路径。
+  c[c_elements - 2] = TMAN_W4A8_MAGIC0;
+  c[c_elements - 1] = TMAN_W4A8_MAGIC1;
+  return 0;
+}
+
+static inline bool tman_w4a8_has_magic(const int32_t *c, int32_t c_elements)
+{
+  // 简单的轻量标记，不引入新的 scratch tensor。
+  return c_elements >= 2 && c[c_elements - 2] == TMAN_W4A8_MAGIC0 && c[c_elements - 1] == TMAN_W4A8_MAGIC1;
+}
+
+static inline int tman_w4a8_finalize_to_q8(
+    int32_t gemm_m,
+    DType y_dtype,
+    const int32_t *c,
+    int32_t c_elements,
+    void *y)
+{
+  if (!tman_is_q8_dtype(y_dtype) || !tman_w4a8_has_magic(c, c_elements)) return -1;
+
+  // 约定 c[m] 已经是“输出 q-domain”的整数值：
+  // - 对 QInt8：直接 clamp 到 [-128, 127]
+  // - 对 QUInt8：加回存储零点 128，再 clamp 到 [0, 255]
+  //
+  // 这里故意不再做浮点 requant，保持 Finalize 足够简单。
+  const int32_t storage_zero_point = tman_q8_storage_zero_point(y_dtype);
+  if (y_dtype == DType::QUInt8)
+  {
+    uint8_t *y_u8 = reinterpret_cast<uint8_t *>(y);
+    for (int32_t m = 0; m < gemm_m; ++m)
+    {
+      int32_t value = c[m] + storage_zero_point;
+      value = std::max(0, std::min(255, value));
+      y_u8[m] = static_cast<uint8_t>(value);
+    }
+    return 0;
+  }
+
+  int8_t *y_s8 = reinterpret_cast<int8_t *>(y);
+  for (int32_t m = 0; m < gemm_m; ++m)
+  {
+    int32_t value = std::max(-128, std::min(127, c[m]));
+    y_s8[m] = static_cast<int8_t>(value);
+  }
+  return 0;
+}
 
 template <typename LType,
           typename XType,

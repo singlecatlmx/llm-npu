@@ -73,6 +73,32 @@ GraphStatus tmanfinalizeImpl(TensorType& y,
   const int32_t gemm_n = y.dims()[2];
 
   const int32_t bits = ((const int32_t*)t_bits.raw_data_const())[0];
+  const DType y_dtype = y.get_dtype();
+  const int32_t c_elements = c.total_storage_bytes() / sizeof(int32_t);
+
+  if (tman_is_q8_dtype(y_dtype))
+  {
+    // W4A8 新路径：
+    // - 输入 c 中保存的是 int32 中间结果
+    // - 结果已经处于输出 q-domain
+    // - Finalize 仅负责做存储域回写
+    if (tman_w4a8_finalize_to_q8(
+            gemm_m,
+            y_dtype,
+            reinterpret_cast<const int32_t *>(c.raw_data_const()),
+            c_elements,
+            y.raw_data()) != 0)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+    return GraphStatus::Success;
+  }
+
+  // 旧路径只接受 Float16 输出，继续走 bit-serial + fp16 收尾。
+  if (y_dtype != DType::Float16)
+  {
+    return GraphStatus::ErrorDimensions;
+  }
 
   const CType* c_ptr = (const CType*)c.raw_data_const();
   XType* y_ptr       = (XType*)y.raw_data();

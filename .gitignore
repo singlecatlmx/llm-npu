@@ -12,6 +12,7 @@ aar-out/
 arm_test/
 buck-out/
 buck2-bin/
+buck2-cache/
 build/
 build-android/
 build-x86/
