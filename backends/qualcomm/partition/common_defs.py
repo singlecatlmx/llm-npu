@@ -29,5 +29,8 @@ constant_operator = [
 allow_list_operator = [
     _operator.getitem,
     exir_ops.edge.tman.linear.default,
+    # 新增的 W4A8 自定义 op 也需要显式放行，否则分区阶段可能把它当成
+    # 未知算子而提前 fallback。
+    exir_ops.edge.tman.linear_w4a8.default,
     exir_ops.edge.tman.bitnet_linear.default,
 ]

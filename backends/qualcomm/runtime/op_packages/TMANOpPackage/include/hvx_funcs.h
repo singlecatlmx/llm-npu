@@ -218,10 +218,10 @@ static inline float tman_w4a8_read_group_scale(
 {
   // 读取某个 (m, q_group) 对应的 group scale。
   //
-  // 当前约定这个 scale 已经由上游折叠好了：
-  //   scale ~= act_per_channel_scale * weight_group_scale * output_requant_scale
-  //
-  // 因此 kernel 不再区分这三部分，而是直接把 group_dot 乘上该 scale。
+  // 这里读取的是 builder 预处理后的“权重 group scale”。
+  // 对 W4A8 路径，builder 还会把 output requant 的逆 scale 折叠进去，
+  // 因此这里读出的 scale 实际上对应：
+  //   weight_group_scale * output_inv_scale
   const int32_t q_tiles = (gemm_k / TMAN_W4A8_G) / TMAN_W4A8_TILE_Q;
   const int32_t q_group_size = group_size / TMAN_W4A8_G;
   const int32_t outputs_per_tile = tile_p / bits;
@@ -278,46 +278,84 @@ static inline int32_t tman_w4a8_read_zero_unsigned(
 
 static inline int tman_w4a8_precompute_from_q8(
     int32_t gemm_k,
+    int32_t group_size,
     DType x_dtype,
     const void *x,
+    const float *input_scale,
     int16_t *l,
     float *ls,
     float *lb)
 {
-  if (!tman_is_q8_dtype(x_dtype) || gemm_k % TMAN_W4A8_G != 0) return -1;
+  if (!tman_is_q8_dtype(x_dtype) || gemm_k % TMAN_W4A8_G != 0 || group_size <= 0) return -1;
 
   // 对于 W4A8 路径，Precompute 的职责改为：
-  // - 从 q8 激活直接构造“精确整数 LUT”
-  // - 不再做旧 W4A16 路径中的 fp16 -> int16 近似量化
+  // - 从 q8 激活和显式输入 per-channel scale 构造 LUT
+  // - 每个 weight group 单独生成一份 ls，用于把带 scale 的 LUT 值压到 int16
+  // - 不使用旧 W4A16 路径里的 lb 语义，仅借用 lb[0] 存 sentinel
   //
   // LUT 的定义与旧路径保持一致：
   // 每 4 个激活值组成一组，对应 16 种 +/- 组合。
   const int32_t q_count = gemm_k / TMAN_W4A8_G;
-  for (int32_t q = 0; q < q_count; ++q)
-  {
-    int32_t xv[TMAN_W4A8_G];
-    for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
-    {
-      xv[ig] = tman_centered_q8_value(x, x_dtype, q * TMAN_W4A8_G + ig);
-    }
+  const int32_t q_group_size = group_size / TMAN_W4A8_G;
+  const int32_t group_count = q_count / q_group_size;
 
-    int16_t *lut = l + q * TMAN_W4A8_LUT_SIZE;
-    for (int32_t idx = 0; idx < TMAN_W4A8_LUT_SIZE; ++idx)
+  for (int32_t group_idx = 0; group_idx < group_count; ++group_idx)
+  {
+    const int32_t q_begin = group_idx * q_group_size;
+
+    float max_abs = 0.0f;
+    for (int32_t q = q_begin; q < q_begin + q_group_size; ++q)
     {
-      // idx 的每一位决定该位置使用 +x 还是 -x。
-      int32_t value = 0;
+      float xv[TMAN_W4A8_G];
       for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
       {
-        value += ((idx >> ig) & 0x1) ? xv[ig] : -xv[ig];
+        const int32_t ch = q * TMAN_W4A8_G + ig;
+        xv[ig] = static_cast<float>(tman_centered_q8_value(x, x_dtype, ch)) * input_scale[ch];
       }
-      lut[idx] = tman_clamp_int16(value);
+
+      for (int32_t idx = 0; idx < TMAN_W4A8_LUT_SIZE; ++idx)
+      {
+        float value = 0.0f;
+        for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
+        {
+          value += ((idx >> ig) & 0x1) ? xv[ig] : -xv[ig];
+        }
+        max_abs = std::max(max_abs, std::fabs(value));
+      }
+    }
+
+    const float ls_value = max_abs > 0.0f
+        ? max_abs / static_cast<float>(std::numeric_limits<int16_t>::max())
+        : 1.0f;
+    ls[group_idx] = ls_value;
+    const float inv_ls = (max_abs > 0.0f) ? (1.0f / ls_value) : 0.0f;
+
+    for (int32_t q = q_begin; q < q_begin + q_group_size; ++q)
+    {
+      float xv[TMAN_W4A8_G];
+      for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
+      {
+        const int32_t ch = q * TMAN_W4A8_G + ig;
+        xv[ig] = static_cast<float>(tman_centered_q8_value(x, x_dtype, ch)) * input_scale[ch];
+      }
+
+      int16_t *lut = l + q * TMAN_W4A8_LUT_SIZE;
+      for (int32_t idx = 0; idx < TMAN_W4A8_LUT_SIZE; ++idx)
+      {
+        float value = 0.0f;
+        for (int32_t ig = 0; ig < TMAN_W4A8_G; ++ig)
+        {
+          value += ((idx >> ig) & 0x1) ? xv[ig] : -xv[ig];
+        }
+        const int32_t q_value = static_cast<int32_t>(std::lrintf(value * inv_ls));
+        lut[idx] = tman_clamp_int16(q_value);
+      }
     }
   }
 
-  // W4A8 路径不再使用旧实现中的 ls/lb 含义。
-  // 为了复用同一套 scratch buffer，这里只在 ls[0] 写入 sentinel。
-  ls[0] = TMAN_W4A8_SENTINEL;
-  lb[0] = 0.0f;
+  // W4A8 路径借用 lb[0] 作为 sentinel，后续 Linear 通过它判断是否走
+  // 新的整数主路径。其余 lb 位置不使用。
+  lb[0] = TMAN_W4A8_SENTINEL;
   return 0;
 }
 
@@ -329,6 +367,8 @@ static inline int tman_w4a8_linear_from_lut(
     int32_t bits,
     int32_t tile_p,
     const int16_t *l,
+    const float *ls,
+    const float *lb,
     const uint8_t *w_bytes,
     const __fp16 *scales,
     int32_t *c,
@@ -339,6 +379,7 @@ static inline int tman_w4a8_linear_from_lut(
   if (group_size % TMAN_W4A8_G != 0 || TMAN_W4A8_TILE_Q % (group_size / TMAN_W4A8_G) != 0) return -1;
   if (tile_p <= 0 || (tile_p % (bits * TMAN_W4A8_VEC_P)) != 0) return -1;
   if (c_elements < gemm_m + 2) return -1;
+  if (lb[0] != TMAN_W4A8_SENTINEL) return -1;
 
   // 该函数是新的 W4A8 整数主路径核心：
   // - 输入：int16 LUT + 预处理后的 4bit weight + 折叠后的 scale
@@ -361,7 +402,8 @@ static inline int tman_w4a8_linear_from_lut(
     {
       // 每个 group 都单独读取一份折叠后的 scale。
       const int32_t q_begin = group_idx * q_group_size;
-      const float scale = tman_w4a8_read_group_scale(scales, gemm_k, group_size, bits, tile_p, m, q_begin);
+      const float act_group_scale = ls[group_idx];
+      const float weight_group_scale = tman_w4a8_read_group_scale(scales, gemm_k, group_size, bits, tile_p, m, q_begin);
       const int32_t zero_unsigned = zero_point
           ? tman_w4a8_read_zero_unsigned(scales, gemm_k, group_size, bits, tile_p, m, q_begin)
           : (1 << (bits - 1));
@@ -397,8 +439,9 @@ static inline int tman_w4a8_linear_from_lut(
         group_dot += dot_unsigned;
       }
 
-      // group_dot 乘折叠后的 scale，累加到输出通道 m。
-      accum += tman_apply_fixed_point_scale(group_dot, scale);
+      // 先恢复 LUT 的真实数值尺度，再乘以 builder 侧预处理好的
+      // weight_group_scale * output_inv_scale。
+      accum += tman_apply_fixed_point_scale(group_dot, act_group_scale * weight_group_scale);
     }
 
     c[m] = tman_clamp_int32(accum);
@@ -419,6 +462,7 @@ static inline bool tman_w4a8_has_magic(const int32_t *c, int32_t c_elements)
 static inline int tman_w4a8_finalize_to_q8(
     int32_t gemm_m,
     DType y_dtype,
+    int32_t storage_zero_point,
     const int32_t *c,
     int32_t c_elements,
     void *y)
@@ -430,7 +474,6 @@ static inline int tman_w4a8_finalize_to_q8(
   // - 对 QUInt8：加回存储零点 128，再 clamp 到 [0, 255]
   //
   // 这里故意不再做浮点 requant，保持 Finalize 足够简单。
-  const int32_t storage_zero_point = tman_q8_storage_zero_point(y_dtype);
   if (y_dtype == DType::QUInt8)
   {
     uint8_t *y_u8 = reinterpret_cast<uint8_t *>(y);

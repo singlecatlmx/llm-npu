@@ -29,6 +29,7 @@ static Qnn_Param_t sg_opDefaultSymmetric = {.paramType = QNN_PARAMTYPE_SCALAR,
 template<typename TensorType>
 GraphStatus tmanprecomputeImpl(TensorType& l,
                                const TensorType& x,
+                               const TensorType& input_scale,
                                const Int32Tensor& t_group_size,
                                const Int32Tensor& t_bits,
                                const Int32Tensor& t_symmetric);
@@ -37,10 +38,11 @@ static float tmanprecomputeCostFunc(const Op *op);
 
 DEF_PACKAGE_OP((tmanprecomputeImpl<Tensor>), "TMANPrecompute")
 
-DEF_TENSOR_PROPERTIES(Op("TMANPrecompute", "x", "group_size", "bits", "symmetric"),
+DEF_TENSOR_PROPERTIES(Op("TMANPrecompute", "x", "input_scale", "group_size", "bits", "symmetric"),
                       Flat("*", "x"),
                       MainMemory("group_size", "bits", "symmetric"),
-                      Tcm("*", "x"))
+                      Tcm("*", "x"),
+                      Flat("input_scale"))
 
 DEF_PACKAGE_PARAM_ORDER("TMANPrecompute",
                         "group_size",
@@ -56,6 +58,7 @@ DEF_PACKAGE_PARAM_ORDER("TMANPrecompute",
 template<typename TensorType>
 GraphStatus tmanprecomputeImpl(TensorType& l,
                                const TensorType& x,
+                               const TensorType& input_scale,
                                const Int32Tensor& t_group_size,
                                const Int32Tensor& t_bits,
                                const Int32Tensor& t_symmetric)
@@ -98,7 +101,15 @@ GraphStatus tmanprecomputeImpl(TensorType& l,
 
     // 先清零 scratch 末尾区域，避免后续读取残留数据。
     std::memset(ls_ptr, 0, sizeof(float) * (ls_reserved + lb_reserved));
-    if (tman_w4a8_precompute_from_q8(gemm_k, x_dtype, x.raw_data_const(), l_ptr, ls_ptr, lb_ptr) != 0)
+    if (tman_w4a8_precompute_from_q8(
+            gemm_k,
+            group_size,
+            x_dtype,
+            x.raw_data_const(),
+            reinterpret_cast<const float *>(input_scale.raw_data_const()),
+            l_ptr,
+            ls_ptr,
+            lb_ptr) != 0)
     {
       return GraphStatus::ErrorDimensions;
     }

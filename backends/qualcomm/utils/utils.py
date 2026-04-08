@@ -15,6 +15,7 @@ import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManagerAd
 import executorch.exir as exir
 
 import torch
+from torch.ao.quantization.fx._decomposed import quantized_decomposed_lib  # noqa: F401
 
 from executorch.backends.qualcomm._passes import AnnotateStack, AnnotateUnbind
 from executorch.backends.qualcomm._passes.qnn_pass_manager import QnnPassManager
@@ -26,6 +27,7 @@ from executorch.backends.qualcomm.builders.node_visitor import (
 from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.builders.custom_ops import (
     tman_linear,
+    tman_linear_w4a8,
     tman_bitnet_linear,
 )
 from executorch.backends.qualcomm.builders.utils import unpack_weights, unpack_gptqv2
@@ -280,6 +282,131 @@ class TMANLinear(torch.nn.Module):
         return s.format(**self.__dict__)
 
 
+class TMANLinearW4A8(TMANLinear):
+    """
+    TMAN W4A8 专用包装层。
+
+    和旧的 TMANLinear 相比，它额外做两件事：
+    1. 持有外部校准文件提供的 input_scale / output_scale；
+    2. 在 forward 里显式插入 quantized_decomposed::quantize_per_channel，
+       让导出图中真的出现“q8 激活 -> TMAN custom op”的结构。
+
+    这样 builder 在 lowering 时看到的就是一条完整的 W4A8 图，而不是
+    一个普通浮点 linear 外加若干 Python buffer。
+    """
+
+    def __init__(
+        self,
+        qlinear: torch.nn.Module,
+        input_scale: torch.Tensor,
+        output_scale: torch.Tensor,
+        act_dtype: torch.dtype = torch.uint8,
+    ):
+        super().__init__(qlinear)
+        # input_scale 对应 linear 输入通道维 K；
+        # output_scale 对应 linear 输出通道维 M。
+        if input_scale.ndim != 1 or input_scale.numel() != self.in_features:
+            raise ValueError(
+                f"TMANLinearW4A8 expects 1D input_scale of length {self.in_features}, "
+                f"but got shape {tuple(input_scale.shape)}"
+            )
+        if output_scale.ndim != 1 or output_scale.numel() != self.out_features:
+            raise ValueError(
+                f"TMANLinearW4A8 expects 1D output_scale of length {self.out_features}, "
+                f"but got shape {tuple(output_scale.shape)}"
+            )
+
+        self.act_dtype = act_dtype
+        # 两组 scale 都作为 buffer 保存在模块里，这样它们会自然进入
+        # export/state_dict/builder 的参数读取流程。
+        self.register_buffer(
+            "input_scale",
+            input_scale.detach().to(dtype=torch.float32, device="cpu"),
+            persistent=True,
+        )
+        self.register_buffer(
+            "output_scale",
+            output_scale.detach().to(dtype=torch.float32, device="cpu"),
+            persistent=True,
+        )
+        zero_point = 128 if act_dtype == torch.uint8 else 0
+        self.register_buffer(
+            "input_zero_points",
+            torch.full_like(self.input_scale, zero_point, dtype=torch.int32),
+            persistent=True,
+        )
+        if act_dtype == torch.uint8:
+            # 采用推荐的通用 8a8w 激活 dtype：uint8 存储，配合对称语义。
+            self.quant_min = 0
+            self.quant_max = 255
+        elif act_dtype == torch.int8:
+            self.quant_min = -128
+            self.quant_max = 127
+        else:
+            raise ValueError(f"Unsupported W4A8 activation dtype: {act_dtype}")
+
+    def _quantize_input(self, x: torch.Tensor) -> torch.Tensor:
+        # 显式发出 quantize_per_channel 节点，而不是手工 round/cast。
+        # 这样 Qualcomm builder/quantizer 能识别这就是标准量化图模式。
+        axis = x.dim() - 1
+        return torch.ops.quantized_decomposed.quantize_per_channel(
+            x.to(torch.float32),
+            self.input_scale.to(x.device),
+            self.input_zero_points.to(x.device),
+            axis,
+            self.quant_min,
+            self.quant_max,
+            self.act_dtype,
+        )
+
+    def forward(self, x):
+        # forward 的图语义是：
+        # fp input
+        #   -> quantize_per_channel (使用外部 input_scale)
+        #   -> tman::linear_w4a8 (携带 input/output scale 与 GPTQ weight)
+        x_q = self._quantize_input(x)
+        return tman_linear_w4a8(
+            x_q,
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.input_scale,
+            self.output_scale,
+            self.g_idx,
+            self.wf_unsqueeze_zero,
+            self.wf_unsqueeze_neg_one,
+            self.group_size,
+            self.bits,
+            self.symmetric,
+            self.gptq_v2,
+        )
+
+    def extra_repr(self):
+        return (
+            super().extra_repr()
+            + f", act_dtype={self.act_dtype}, input_scale_shape={tuple(self.input_scale.shape)}, output_scale_shape={tuple(self.output_scale.shape)}"
+        )
+
+
+def _lookup_tman_w4a8_scale_pair(
+    act_scales: dict,
+    module_name: str,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    # 外部 pt 文件的键名来自原始 HuggingFace/Qwen3 模块路径。
+    # 这里兼容几种常见前缀形式，尽量减少导入时的路径耦合。
+    candidates = [
+        module_name,
+        f"model.{module_name}",
+        f"model.model.{module_name}",
+    ]
+    for candidate in candidates:
+        input_key = f"{candidate}.input_scale"
+        output_key = f"{candidate}.output_scale"
+        if input_key in act_scales or output_key in act_scales:
+            return act_scales.get(input_key), act_scales.get(output_key)
+    return None, None
+
+
 def convert_qlinear_to_tman_linear(module: torch.nn.Module):
     # 动态导入gptqmodel组件以避免循环导入问题
     try:
@@ -313,6 +440,69 @@ def convert_qlinear_to_tman_linear(module: torch.nn.Module):
         return module
 
     return replace_qlinear(module)
+
+
+def convert_qlinear_to_tman_linear_w4a8(
+    module: torch.nn.Module,
+    act_scales: dict,
+    module_prefix: str = "",
+    act_dtype: torch.dtype = torch.uint8,
+):
+    # 把 GPTQ 的 TorchQuantLinear 替换成我们新的 TMANLinearW4A8。
+    #
+    # 这里与旧的 convert_qlinear_to_tman_linear 最大的区别是：
+    # 每个 linear 在替换时必须能从外部 pt 文件中查到一对
+    # input_scale / output_scale，否则直接报错，避免后面带着半残缺
+    # 的量化参数继续导出。
+    # 动态导入gptqmodel组件以避免循环导入问题
+    try:
+        import importlib
+        qlinear_base_module = importlib.import_module('gptqmodel.nn_modules.qlinear')
+        BaseQuantLinear = getattr(qlinear_base_module, 'BaseQuantLinear')
+        torch_qlinear_module = importlib.import_module('gptqmodel.nn_modules.qlinear.torch')
+        TorchQuantLinear = getattr(torch_qlinear_module, 'TorchQuantLinear')
+    except ImportError as e:
+        try:
+            from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+        except ImportError as e2:
+            raise RuntimeError(f"无法导入gptqmodel组件: 动态导入失败({e}), 直接导入失败({e2})")
+
+    def replace_qlinear(current_module: torch.nn.Module, prefix: str):
+        attr_strs = dir(current_module)
+        if isinstance(current_module, torch.nn.ModuleList):
+            attr_strs += [str(i) for i in range(len(current_module))]
+
+        for attr_str in attr_strs:
+            target_attr = getattr(current_module, attr_str)
+            full_name = f"{prefix}.{attr_str}" if prefix else attr_str
+            if isinstance(target_attr, BaseQuantLinear):
+                if not isinstance(target_attr, TorchQuantLinear):
+                    raise RuntimeError("Only GPTQ TorchQuantLinear backend is supported")
+                input_scale, output_scale = _lookup_tman_w4a8_scale_pair(act_scales, full_name)
+                if input_scale is None or output_scale is None:
+                    raise KeyError(
+                        f"Missing W4A8 input/output scale for module '{full_name}'. "
+                        "Please ensure the external pt file contains a matching key."
+                    )
+                target_attr.post_init()
+                setattr(
+                    current_module,
+                    attr_str,
+                    TMANLinearW4A8(
+                        target_attr,
+                        input_scale=input_scale,
+                        output_scale=output_scale,
+                        act_dtype=act_dtype,
+                    ),
+                )
+
+        for child_name, sub_module in current_module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            replace_qlinear(sub_module, child_prefix)
+        return current_module
+
+    return replace_qlinear(module, module_prefix)
 
 
 # https://github.com/huggingface/transformers/pull/37742

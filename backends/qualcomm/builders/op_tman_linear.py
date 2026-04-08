@@ -10,9 +10,20 @@ import executorch.backends.qualcomm.python.PyQnnWrapperAdaptor as PyQnnWrapper
 
 import numpy as np
 import torch
-from executorch.backends.qualcomm.utils.constants import QCOM_DATA
+from executorch.backends.qualcomm.utils.constants import (
+    QCOM_AXIS,
+    QCOM_DATA,
+    QCOM_DTYPE,
+    QCOM_ENCODING,
+    QCOM_QUANT_ATTRS,
+    QCOM_QUANT_MAX,
+    QCOM_QUANT_MIN,
+    QCOM_SCALES,
+    QCOM_ZERO_POINTS,
+)
 from executorch.backends.qualcomm.builders.utils import unpack_gptqv2, hvx_preprocess_weights, unpack_weights
 import logging
+from executorch.exir.dialects._ops import ops as exir_ops
 
 from .node_visitor import NodeVisitor, register_node_visitor
 from .qnn_constants import (
@@ -80,10 +91,46 @@ def _decide_tile_size(
         logger.warning(f"Can't find optimal tile size that is multiple of {divider} and fits in VTCM, use {res} as workaround")
     return res
 
+def _set_w4a8_output_quant_attrs(
+    node: torch.fx.Node,
+    output_scale: torch.Tensor,
+    act_dtype: torch.dtype = torch.uint8,
+) -> None:
+    # 对 W4A8 路径，我们希望输出张量本身就是“量化张量”。
+    # 因此这里直接覆盖 node.meta 里的量化属性，让 builder 在定义输出
+    # tensor wrapper 时使用外部校准文件给出的 output_scale，而不是沿用
+    # PTQ 自动观察到的默认结果。
+    if output_scale.ndim != 1:
+        raise ValueError(
+            f"TMANLinear W4A8 expects 1D output_scale, got shape {tuple(output_scale.shape)}"
+        )
+    if act_dtype == torch.uint8:
+        quant_min, quant_max = 0, 255
+        zero_point = 128
+    elif act_dtype == torch.int8:
+        quant_min, quant_max = -128, 127
+        zero_point = 0
+    else:
+        raise ValueError(f"Unsupported W4A8 activation dtype for output: {act_dtype}")
+
+    node.meta[QCOM_QUANT_ATTRS] = {
+        QCOM_ENCODING: exir_ops.edge.quantized_decomposed.quantize_per_channel.default,
+        QCOM_DTYPE: act_dtype,
+        QCOM_QUANT_MIN: quant_min,
+        QCOM_QUANT_MAX: quant_max,
+        QCOM_AXIS: len(node.meta["val"].shape) - 1,
+        QCOM_SCALES: output_scale.detach().to(dtype=torch.float32, device="cpu"),
+        QCOM_ZERO_POINTS: torch.full_like(
+            output_scale.detach().to(dtype=torch.float32, device="cpu"),
+            zero_point,
+            dtype=torch.int32,
+        ),
+    }
+
 
 @register_node_visitor
 class TMANLinear(NodeVisitor):
-    target = ["tman.linear.default", "tman.bitnet_linear.default"]
+    target = ["tman.linear.default", "tman.linear_w4a8.default", "tman.bitnet_linear.default"]
 
     def __init__(self, *args) -> None:
         super().__init__(*args)
@@ -94,6 +141,9 @@ class TMANLinear(NodeVisitor):
         node: torch.fx.Node,
         nodes_to_wrappers: Dict[str, PyQnnWrapper.TensorWrapper],
     ) -> PyQnnWrapper.PyQnnOpWrapper:
+        # 旧 TMANLinear 走 W4A16 路径，需要前后插 Convert；
+        # 新的 tman.linear_w4a8 则直接吃 q8 输入，不再插 Convert。
+        self.add_convert = node.target.__name__ != "tman.linear_w4a8.default"
         input_node = node.args[0]
         input_tensor = self.get_tensor(input_node, node)
         input_tensor_wrapper = self.define_tensor(
@@ -115,6 +165,10 @@ class TMANLinear(NodeVisitor):
             bits = cast(int, node.args[8])
             symmetric = cast(bool, node.args[9])
             gptq_v2 = cast(bool, node.args[10])
+            input_scale_node = None
+            input_scale_tensor = torch.ones((1), dtype=torch.float32)
+            output_scale_node = None
+            output_scale_tensor = torch.ones((1), dtype=torch.float32)
 
             qweight_repacked, scales_repacked, zeros_repacked, ref_bits, ref_group_size, ref_symmetric = unpack_gptqv2(
                 qweight_tensor.detach().numpy(),
@@ -125,6 +179,45 @@ class TMANLinear(NodeVisitor):
             assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
                 f"TMANLinear: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
             )
+        elif node.target.__name__ == "tman.linear_w4a8.default":
+            self.add_convert = False
+            # W4A8 自定义 op 的参数布局：
+            # x_q, qweight, scales, qzeros, input_scale, output_scale,
+            # g_idx, wf_unsqueeze_zero, wf_unsqueeze_neg_one,
+            # group_size, bits, symmetric, gptq_v2
+            qweight_node = node.args[1]
+            qweight_tensor = get_parameter(qweight_node, self.edge_program)
+            scales_node = node.args[2]
+            scales_tensor = get_parameter(scales_node, self.edge_program)
+            qzeros_node = node.args[3]
+            qzeros_tensor = get_parameter(qzeros_node, self.edge_program)
+            input_scale_node = node.args[4]
+            input_scale_tensor = get_parameter(input_scale_node, self.edge_program)
+            output_scale_node = node.args[5]
+            output_scale_tensor = get_parameter(output_scale_node, self.edge_program)
+            group_size = cast(int, node.args[9])
+            bits = cast(int, node.args[10])
+            symmetric = cast(bool, node.args[11])
+            gptq_v2 = cast(bool, node.args[12])
+
+            qweight_repacked, scales_repacked, zeros_repacked, ref_bits, ref_group_size, ref_symmetric = unpack_gptqv2(
+                qweight_tensor.detach().numpy(),
+                scales_tensor.detach().numpy(),
+                qzeros_tensor.detach().numpy(),
+                gptq_v2,
+            )
+            assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
+                f"TMANLinearW4A8: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
+            )
+            # 1. output_scale 用来定义输出张量的量化属性；
+            # 2. 同时把它折叠进预处理后的 weight scale，便于 kernel 直接把
+            #    int32 累加结果落到输出 q-domain。
+            if output_scale_tensor is None:
+                raise ValueError(f"TMANLinearW4A8 missing output_scale tensor for node {node.name}")
+            _set_w4a8_output_quant_attrs(node, output_scale_tensor.detach())
+            # Fold the external output scale into the per-group weight scale so
+            # the kernel can accumulate directly into the output q-domain.
+            scales_repacked = scales_repacked / output_scale_tensor.detach().numpy()[:, None]
         elif node.target.__name__ == "tman.bitnet_linear.default":
             qweight_node = node.args[1]
             qweight_tensor = get_parameter(qweight_node, self.edge_program)
@@ -133,6 +226,10 @@ class TMANLinear(NodeVisitor):
             group_size = 0
             bits = 2
             symmetric = True
+            input_scale_node = None
+            input_scale_tensor = torch.ones((1), dtype=torch.float32)
+            output_scale_node = None
+            output_scale_tensor = torch.ones((1), dtype=torch.float32)
 
             qweight_repacked = (unpack_weights(qweight_tensor.detach(), dtype=torch.int8) + 2).to(torch.uint8).numpy()
             scales_repacked = scales_tensor.detach().numpy()
@@ -173,6 +270,15 @@ class TMANLinear(NodeVisitor):
             torch.from_numpy(scales_repacked),
             PyQnnWrapper.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
             nodes_to_wrappers,
+        )
+
+        input_scale_tensor_wrapper = self.define_tensor(
+            input_scale_node if input_scale_node is not None else scales_node,
+            node,
+            input_scale_tensor.detach().to(torch.float32),
+            PyQnnWrapper.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
+            nodes_to_wrappers,
+            node_name=node.name + "_input_scale",
         )
 
         # do not quantize scratch buffer
@@ -250,7 +356,13 @@ class TMANLinear(NodeVisitor):
             QNN_OP_PACKAGE_NAME_TMAN,
             OpTMANPrecompute.op_name,
         )
-        precompute_op.AddInputTensors([input_tensor_wrapper])
+        # Precompute 现在固定接两个输入：
+        # - x / x_q
+        # - input_scale
+        #
+        # 对旧 W4A16 路径，input_scale 传 dummy 1；
+        # 对 W4A8 路径，传真实外部校准得到的 per-channel input_scale。
+        precompute_op.AddInputTensors([input_tensor_wrapper, input_scale_tensor_wrapper])
         precompute_op.AddOutputTensors([l_tensor_wrapper])
         precompute_op.AddScalarParam(
             OpTMANPrecompute.param_group_size,

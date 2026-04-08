@@ -75,6 +75,35 @@ def _dequantize_weight(
     return weights
 
 
+def _dequantize_activation_per_channel(
+    x_q: torch.Tensor,
+    input_scale: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    对最后一维做 per-channel 对称反量化。
+
+    这里是 W4A8 Python 参考实现里对输入激活的还原逻辑：
+    - x_q      : 图中显式量化后的 8bit 激活
+    - input_scale : 外部 pt 文件提供的每个输入通道 scale
+    - dtype    : 当前量化存储 dtype
+
+    目前我们沿用 Qualcomm 推荐的 8a8w 激活 dtype 约定，主路径使用
+    uint8 + symmetric 语义（零点固定为 128）；为了调试方便，也兼容 int8。
+    """
+    view_shape = [1] * (x_q.dim() - 1) + [x_q.shape[-1]]
+    scale = input_scale.to(device=x_q.device, dtype=torch.float32).view(view_shape)
+
+    if dtype == torch.uint8:
+        zero_point = 128
+    elif dtype == torch.int8:
+        zero_point = 0
+    else:
+        raise ValueError(f"Unsupported W4A8 activation dtype: {dtype}")
+
+    return (x_q.to(torch.float32) - zero_point) * scale
+
+
 @torch.library.custom_op("tman::linear", mutates_args=())
 def tman_linear(
     x: torch.Tensor,
@@ -122,6 +151,78 @@ def tman_linear_fake(
     out_features = qweight.shape[1]
     out_shape = x.shape[:-1] + (out_features,)
     return x.new_zeros(out_shape)
+
+
+@torch.library.custom_op("tman::linear_w4a8", mutates_args=())
+def tman_linear_w4a8(
+    x_q: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    """
+    TMAN W4A8 路径的 Python 参考实现。
+
+    builder 最终会把这个 op lowering 到 TMAN OpPackage 的整数主路径。
+    但在 eager/export/PT2E 阶段，仍然需要一个可以直接执行的参考版本，
+    所以这里保留一条纯 Python 浮点参考链路：
+
+    1. 用外部 input_scale 把输入 q8 激活反量化回浮点；
+    2. 把 GPTQ 的 4bit 权重反量化回浮点；
+    3. 用普通 matmul 得到参考输出。
+
+    注意：
+    - output_scale 被显式放进 op 签名里，目的是让 builder 在 lowering
+      阶段可以直接读到外部校准得到的输出量化参数；
+    - 这个 Python 参考实现本身不直接消费 output_scale。
+    """
+    out_features = qweight.shape[1]
+    out_shape = x_q.shape[:-1] + (out_features,)
+    x = _dequantize_activation_per_channel(x_q, input_scale, x_q.dtype).reshape(
+        -1, x_q.shape[-1]
+    )
+    weights = _dequantize_weight(
+        qweight,
+        scales,
+        qzeros,
+        g_idx,
+        wf_unsqueeze_zero,
+        wf_unsqueeze_neg_one,
+        bits,
+    ).to(x.dtype)
+    out = torch.matmul(x, weights).reshape(out_shape)
+    return out.to(x.dtype)
+
+
+@tman_linear_w4a8.register_fake
+def tman_linear_w4a8_fake(
+    x_q: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    # fake kernel 只需要给出正确形状，便于 export / shape propagation。
+    out_features = qweight.shape[1]
+    out_shape = x_q.shape[:-1] + (out_features,)
+    return input_scale.new_zeros(out_shape, dtype=torch.float32)
 
 
 @torch.library.custom_op("tman::bitnet_linear", mutates_args=())

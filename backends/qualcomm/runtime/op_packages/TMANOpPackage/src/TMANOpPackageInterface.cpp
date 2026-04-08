@@ -225,7 +225,7 @@ Qnn_ErrorHandle_t TMANOpPackageValidateOpConfig (Qnn_OpConfig_t opConfig){
         }
     }
     else if (std::string(opConfig.v1.typeName) == "TMANPrecompute"){
-        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 || opConfig.v1.numOfOutputs != 1){
+        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 2 || opConfig.v1.numOfOutputs != 1){
           return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
         }
     }
@@ -284,5 +284,4 @@ Qnn_ErrorHandle_t TMANOpPackageInterfaceProvider(QnnOpPackage_Interface_t* inter
 #ifdef __cplusplus
 }
 #endif
-
 

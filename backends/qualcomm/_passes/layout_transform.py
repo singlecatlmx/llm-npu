@@ -101,6 +101,9 @@ class LayoutTransform(ExportPass):
         _operator.getitem,
         torch.ops.aten.scalar_tensor.default,
         exir_ops.edge.tman.linear.default,
+        # W4A8 路径沿用 TMAN custom op 的图语义，因此也要纳入 layout
+        # transform 支持列表，避免在 axis_order 传播时被漏掉。
+        exir_ops.edge.tman.linear_w4a8.default,
         exir_ops.edge.tman.bitnet_linear.default,
     }
 

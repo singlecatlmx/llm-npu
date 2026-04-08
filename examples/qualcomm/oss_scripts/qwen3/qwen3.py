@@ -52,6 +52,7 @@ from executorch.backends.qualcomm.utils.utils import (
     convert_linear_to_conv2d,
     convert_linear_to_qlinear,
     convert_qlinear_to_tman_linear,
+    convert_qlinear_to_tman_linear_w4a8,
     convert_qlinear_to_linear,
     generate_composite_llama_program,
     generate_htp_compiler_spec,
@@ -103,6 +104,40 @@ sys.setrecursionlimit(4096)
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
+
+
+def _load_tman_w4a8_scales(scale_pt_path: str) -> dict[str, torch.Tensor]:
+    """
+    读取外部激活校准文件。
+
+    当前 W4A8 路径约定 pt 文件中每个 linear 层都提供两组张量：
+    - *.input_scale
+    - *.output_scale
+
+    这里不强行在加载阶段逐项校验具体键名，而是先把所有 tensor 规范化为
+    float32，后续在模块替换阶段再按模块路径做精确匹配。
+    """
+    scale_data = torch.load(scale_pt_path, map_location="cpu")
+    if not isinstance(scale_data, dict):
+        raise RuntimeError(
+            f"Expected TMAN W4A8 scale file to be a dict, but got {type(scale_data)}"
+        )
+
+    normalized_scales = {}
+    for key, value in scale_data.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        normalized_scales[key] = value.detach().to(dtype=torch.float32, device="cpu")
+
+    if len(normalized_scales) == 0:
+        raise RuntimeError(f"No tensor scales found in {scale_pt_path}")
+
+    logging.info(
+        "Loaded TMAN W4A8 external scales: %d tensors from %s",
+        len(normalized_scales),
+        scale_pt_path,
+    )
+    return normalized_scales
 
 
 def smart_mask_updater(
@@ -631,12 +666,45 @@ def compile(args, pte_filename, tokenizer):
                 dtype_override.to_torch_dtype()
             )
 
+    tman_w4a8_scales = None
+    if args.use_tman and args.ptq == "8a8w":
+        # W4A8 路径优先使用外部 activation_scales.pt。
+        # 如果用户没有显式传参，就尝试从 model_dir 下自动发现。
+        scale_pt_path = args.tman_w4a8_scales_pt
+        if scale_pt_path is None:
+            candidate = os.path.join(args.model_dir, "activation_scales.pt")
+            if os.path.exists(candidate):
+                scale_pt_path = candidate
+        if not scale_pt_path:
+            raise RuntimeError(
+                "TMAN W4A8 path requires activation_scales.pt. "
+                "Please pass --tman_w4a8_scales_pt or place activation_scales.pt under model_dir."
+            )
+        tman_w4a8_scales = _load_tman_w4a8_scales(scale_pt_path)
+
     for llama_instance in llama_instance_list:
-        for layer in llama_instance.model.layers:
+        for layer_idx, layer in enumerate(llama_instance.model.layers):
             if args.use_tman:
-                convert_qlinear_to_tman_linear(layer.self_attn)
+                if tman_w4a8_scales is not None:
+                    # 对 attention / MLP 的 GPTQ linear 做专门的 W4A8 替换。
+                    # 替换后每个 linear 都会持有自己的 input_scale/output_scale，
+                    # 并在导出图中显式发出 q8 激活输入。
+                    convert_qlinear_to_tman_linear_w4a8(
+                        layer.self_attn,
+                        tman_w4a8_scales,
+                        module_prefix=f"model.layers.{layer_idx}.self_attn",
+                        act_dtype=torch.uint8,
+                    )
+                    convert_qlinear_to_tman_linear_w4a8(
+                        layer.mlp,
+                        tman_w4a8_scales,
+                        module_prefix=f"model.layers.{layer_idx}.mlp",
+                        act_dtype=torch.uint8,
+                    )
+                else:
+                    convert_qlinear_to_tman_linear(layer.self_attn)
+                    convert_qlinear_to_tman_linear(layer.mlp)
                 layer.self_attn.prepare_tman()
-                convert_qlinear_to_tman_linear(layer.mlp)
             else:
                 convert_qlinear_to_linear(layer.self_attn)
                 layer.self_attn.prepare_sha()
@@ -1228,6 +1296,13 @@ def _build_parser():
         "--use_tman",
         action="store_true",
         help="Use TMANLinear instead of QNNConv2d.",
+    )
+
+    parser.add_argument(
+        "--tman_w4a8_scales_pt",
+        default=None,
+        type=str,
+        help="Path to external per-channel activation scale pt file for TMAN W4A8.",
     )
 
     parser.add_argument(

@@ -232,6 +232,9 @@ def annotate_matmul_16a8w(gm: torch.fx.GraphModule) -> None:  # noqa: C901
                 break
             elif node.target in [
                 torch.ops.tman.linear.default,
+                # W4A8 的 TMAN linear 也属于“这里先停止向前继续打 8a 标签”的
+                # 节点类型，因为它自己会在专门路径中显式处理输入 q8 激活。
+                torch.ops.tman.linear_w4a8.default,
                 torch.ops.tman.bitnet_linear.default,
                 torch.ops.aten.split_with_sizes.default,
                 operator.getitem,

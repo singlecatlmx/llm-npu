@@ -1234,13 +1234,34 @@ def annotate_split_with_sizes(node: Node, quantization_config: QuantizationConfi
 
 
 try:
-    from executorch.backends.qualcomm.builders.custom_ops import tman_linear, tman_bitnet_linear
+    from executorch.backends.qualcomm.builders.custom_ops import (
+        tman_linear,
+        tman_linear_w4a8,
+        tman_bitnet_linear,
+    )
     @register_annotator([torch.ops.tman.linear.default])
     def annotate_tman_linear(node: Node, quantization_config: QuantizationConfig) -> None:
         if _is_annotated([node]):
             return
         # We can use single_in_single_out since we don't want to quantize qweight and scales input
         annotate_single_in_single_out(node, quantization_config)
+
+
+    @register_annotator([torch.ops.tman.linear_w4a8.default])
+    def annotate_tman_linear_w4a8(node: Node, quantization_config: QuantizationConfig) -> None:
+        if _is_annotated([node]):
+            return
+        # W4A8 路径的输入 q8 激活已经在 TMANLinearW4A8.forward 中显式通过
+        # quantize_per_channel 节点构造出来，所以这里主要关心图可见的输出。
+        #
+        # 我们固定给它打上“对称 8bit 激活输出”的标注，确保后续 PTQ / builder
+        # 看到的是一条完整的 W4A8 量化路径。
+        from executorch.backends.qualcomm.quantizer.qconfig import get_8a8w_qnn_ptq_config
+
+        annotate_single_in_single_out(
+            node,
+            get_8a8w_qnn_ptq_config(act_symmetric=True),
+        )
 
 
     @register_annotator([torch.ops.tman.bitnet_linear.default])

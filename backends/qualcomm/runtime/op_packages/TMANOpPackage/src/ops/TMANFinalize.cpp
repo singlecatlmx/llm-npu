@@ -82,9 +82,11 @@ GraphStatus tmanfinalizeImpl(TensorType& y,
     // - 输入 c 中保存的是 int32 中间结果
     // - 结果已经处于输出 q-domain
     // - Finalize 仅负责做存储域回写
+    const int32_t storage_zero_point = tman_q8_storage_zero_point(y_dtype);
     if (tman_w4a8_finalize_to_q8(
             gemm_m,
             y_dtype,
+            storage_zero_point,
             reinterpret_cast<const int32_t *>(c.raw_data_const()),
             c_elements,
             y.raw_data()) != 0)

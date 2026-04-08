@@ -147,7 +147,7 @@ GraphStatus tmanlinearImpl(TensorType& c,
   CType* c_ptr         = (CType*)c.raw_data();
   const int32_t c_elements = c.total_storage_bytes() / sizeof(int32_t);
 
-  if (bits == TMAN_W4A8_BITS && ls_ptr[0] == TMAN_W4A8_SENTINEL)
+  if (bits == TMAN_W4A8_BITS && lb_ptr[0] == TMAN_W4A8_SENTINEL)
   {
     // 看到 sentinel，说明上游 Precompute 已经走了 W4A8 新路径。
     // 此时不再进入旧的 hvx_tbl(float 累加) 实现，而是改走新的
@@ -172,6 +172,8 @@ GraphStatus tmanlinearImpl(TensorType& c,
             bits,
             tile_p,
             l_ptr,
+            ls_ptr,
+            lb_ptr,
             w_ptr,
             s_ptr,
             reinterpret_cast<int32_t *>(c.raw_data()),
