@@ -145,11 +145,21 @@ def smart_mask_updater(
 ):
     # Update the KV cache input for the next inference when the position exceeds the autoregressive length.
     if pos >= ar_len:
+        def _normalize_k_cache(new_k_cache: torch.Tensor) -> torch.Tensor:
+            # 原始 attention.forward 在 output_new_cache_only=True 时返回 [B, D]，
+            # prepare_tman/prepare_sha 路径返回 [B, D, 1]。这里统一成 [B, D, 1]。
+            return new_k_cache.unsqueeze(-1) if new_k_cache.dim() == 2 else new_k_cache
+
+        def _normalize_v_cache(new_v_cache: torch.Tensor) -> torch.Tensor:
+            # 原始 attention.forward 在 output_new_cache_only=True 时返回 [B, D]，
+            # prepare_tman/prepare_sha 路径返回 [B, 1, D]。这里统一成 [B, 1, D]。
+            return new_v_cache.unsqueeze(1) if new_v_cache.dim() == 2 else new_v_cache
+
         for i, k_cache in enumerate(k_caches):
-            k_cache[:, :, pos - ar_len] = new_k_caches[i][:, :, 0]
+            k_cache[:, :, pos - ar_len] = _normalize_k_cache(new_k_caches[i])[:, :, 0]
 
         for i, v_cache in enumerate(v_caches):
-            v_cache[:, pos - ar_len, :] = new_v_caches[i][:, 0, :]
+            v_cache[:, pos - ar_len, :] = _normalize_v_cache(new_v_caches[i])[:, 0, :]
         atten_mask[:, :, pos - ar_len] = 0
 
     pos += 1
@@ -161,12 +171,18 @@ def shift_pointer_updater(
 ):
     # Update the KV cache input for the next inference when the position exceeds the autoregressive length.
     if pos >= ar_len:
+        def _normalize_k_cache(new_k_cache: torch.Tensor) -> torch.Tensor:
+            return new_k_cache.unsqueeze(-1) if new_k_cache.dim() == 2 else new_k_cache
+
+        def _normalize_v_cache(new_v_cache: torch.Tensor) -> torch.Tensor:
+            return new_v_cache.unsqueeze(1) if new_v_cache.dim() == 2 else new_v_cache
+
         k_caches = [
-            torch.cat([k_cache[:, :, 1:], new_k_caches[i][:, :, :1]], dim=-1)
+            torch.cat([k_cache[:, :, 1:], _normalize_k_cache(new_k_caches[i])[:, :, :1]], dim=-1)
             for i, k_cache in enumerate(k_caches)
         ]
         v_caches = [
-            torch.cat([v_cache[:, 1:, :], new_v_caches[i][:, :1, :]], dim=1)
+            torch.cat([v_cache[:, 1:, :], _normalize_v_cache(new_v_caches[i])[:, :1, :]], dim=1)
             for i, v_cache in enumerate(v_caches)
         ]
         atten_mask[:, :, -pos - 1] = 0
@@ -347,6 +363,7 @@ class SingleLlama:
         self.dep_table = get_passes_dependency_for_capture_program()
         self.quant_attrs = None
         self.quant_dtype = None
+        self.extra_skip_node_op_set = set()
         self.llama_meta = self.llama_model.get_metadata()
         self.has_quant_io = False
         self.pte_filename = pte_filename
@@ -507,7 +524,8 @@ class SingleLlama:
             )
             logging.info(f"🚀 Starting QNN compilation with Backend: {'HTP' if backend_options.backend_type.name == 'kHtpBackend' else 'CPU'}")
             
-            skip_node_op_set = {"llama.fallback.default"}
+            skip_node_op_set = {"llama.fallback.default"} | self.extra_skip_node_op_set
+            logging.info("🔎 Export/Lowering: entering to_edge_transform_and_lower_to_qnn")
             edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
                 self.llama_graph_module,
                 self.inputs,
@@ -517,6 +535,7 @@ class SingleLlama:
                 passes_job=self.passes_job,
                 skip_node_op_set=skip_node_op_set,
             )
+            logging.info("🔎 Export/Lowering: finished to_edge_transform_and_lower_to_qnn")
 
             for n in edge_prog_mgr.exported_program().graph.nodes:
                 if n.op == "output":
@@ -530,7 +549,9 @@ class SingleLlama:
             if verbose:
                 print_delegation_info(edge_prog_mgr.exported_program().graph_module)
 
+            logging.info("🔎 Export/Lowering: entering to_executorch")
             exec_prog_mgr = edge_prog_mgr.to_executorch(config=executorch_config)
+            logging.info("🔎 Export/Lowering: finished to_executorch")
             with open(f"{work_space}/{self.pte_filename}.pte", "wb") as file:
                 exec_prog_mgr.write_to_file(file)
 
@@ -550,6 +571,8 @@ def compile(args, pte_filename, tokenizer):
     logging.info(f"🎯 Target: {args.model} ({args.soc_model if hasattr(args, 'soc_model') else 'SM8650'})")
     logging.info(f"🔧 TMAN: {'Enabled' if args.use_tman else 'Disabled'}")
     logging.info(f"📊 Quantization: {args.ptq if args.ptq else 'None'}")
+    logging.info(f"🎚️ TMAN Activation Mode: {args.tman_act_mode}")
+    logging.info(f"🎯 TMAN 8a Scope: {args.tman_linear_scope}")
     
     # 检查QNN OpPackage配置
     qnn_op_paths = os.environ.get('QNN_OP_PACKAGE_PATHS', 'Not set')
@@ -666,8 +689,13 @@ def compile(args, pte_filename, tokenizer):
                 dtype_override.to_torch_dtype()
             )
 
+    use_tman_w4a8 = args.use_tman and args.tman_act_mode == "8a"
+    use_tman_w4a8_attn = use_tman_w4a8 and args.tman_linear_scope in ("attn", "all")
+    use_tman_w4a8_mlp = use_tman_w4a8 and args.tman_linear_scope in ("mlp", "all")
+    mixed_tman_linear_only_mode = use_tman_w4a8
+
     tman_w4a8_scales = None
-    if args.use_tman and args.ptq == "8a8w":
+    if use_tman_w4a8:
         # W4A8 路径优先使用外部 activation_scales.pt。
         # 如果用户没有显式传参，就尝试从 model_dir 下自动发现。
         scale_pt_path = args.tman_w4a8_scales_pt
@@ -684,17 +712,25 @@ def compile(args, pte_filename, tokenizer):
 
     for llama_instance in llama_instance_list:
         for layer_idx, layer in enumerate(llama_instance.model.layers):
-            if args.use_tman:
-                if tman_w4a8_scales is not None:
-                    # 对 attention / MLP 的 GPTQ linear 做专门的 W4A8 替换。
-                    # 替换后每个 linear 都会持有自己的 input_scale/output_scale，
-                    # 并在导出图中显式发出 q8 激活输入。
+            if use_tman_w4a8:
+                # 对 attention / MLP 的目标 linear 做 W4A8 替换。
+                # 关键点：
+                # - 这里只让“线性层本身”内部走 q8 activation
+                # - 整体 attention 算法仍然保持浮点图
+                # - 这样 q/k/v/o 也可以吃 8a，但外围 add/cat/index/mask/matmul
+                #   不再被整图 PTQ 和 QNN delegate 一起裹进去
+                if use_tman_w4a8_attn:
                     convert_qlinear_to_tman_linear_w4a8(
                         layer.self_attn,
                         tman_w4a8_scales,
                         module_prefix=f"model.layers.{layer_idx}.self_attn",
                         act_dtype=torch.uint8,
                     )
+                else:
+                    convert_qlinear_to_linear(layer.self_attn)
+                    layer.self_attn.prepare_sha()
+
+                if use_tman_w4a8_mlp:
                     convert_qlinear_to_tman_linear_w4a8(
                         layer.mlp,
                         tman_w4a8_scales,
@@ -702,8 +738,10 @@ def compile(args, pte_filename, tokenizer):
                         act_dtype=torch.uint8,
                     )
                 else:
-                    convert_qlinear_to_tman_linear(layer.self_attn)
-                    convert_qlinear_to_tman_linear(layer.mlp)
+                    convert_qlinear_to_linear(layer.mlp)
+            elif args.use_tman:
+                convert_qlinear_to_tman_linear(layer.self_attn)
+                convert_qlinear_to_tman_linear(layer.mlp)
                 layer.self_attn.prepare_tman()
             else:
                 convert_qlinear_to_linear(layer.self_attn)
@@ -712,7 +750,8 @@ def compile(args, pte_filename, tokenizer):
 
     use_fp16 = True
     fixed_point_type = {"kv_type": torch.float32, "io_type": torch.float32}
-    if args.ptq:
+    full_graph_ptq_enabled = bool(args.ptq) and not mixed_tman_linear_only_mode
+    if full_graph_ptq_enabled:
         use_fp16 = False
         fixed_point_type["kv_type"] = torch.uint8
         if args.ptq == "8a8w":
@@ -726,6 +765,10 @@ def compile(args, pte_filename, tokenizer):
                 "16a4w_block",
             ], f"No support for quant type {args.ptq}. Support 8a8w, 16a4w and 16a4w_block."
         quant_dtype = getattr(QuantDtype, f"use_{args.ptq}")
+    elif mixed_tman_linear_only_mode:
+        logging.info(
+            "TMAN 8a mixed mode enabled: skip full-graph PTQ and keep non-TMAN graph in fp16/fp32."
+        )
 
     assert args.tokenizer_model is not None, "Need tokenizer model for calibration"
 
@@ -734,20 +777,46 @@ def compile(args, pte_filename, tokenizer):
             llama_instance_list[i] = get_quant_embedding_transform(args)(
                 llama_instance_list[i]
             )
-        llama_instance_list[i] = convert_linear_to_conv2d(llama_instance_list[i])
+        # TMAN 8a mixed 模式下尽量保持剩余 Linear 维持原生 aten.linear，
+        # 避免额外的 Linear->Conv2D 图改写干扰 attention 子图形态。
+        if not use_tman_w4a8:
+            llama_instance_list[i] = convert_linear_to_conv2d(llama_instance_list[i])
         llama_instance_list[i] = SingleLlama(
             llama_instance_list[i].eval(), pte_filename
         )
+        if mixed_tman_linear_only_mode:
+            llama_instance_list[i].extra_skip_node_op_set = {
+                "aten.add.Tensor",
+                "aten.cat.default",
+                "aten.matmul.default",
+                "aten.mul.Tensor",
+                "aten.softmax.int",
+                "aten._softmax.default",
+                "aten.select.int",
+                "aten.slice.Tensor",
+                "aten.slice_copy.Tensor",
+                "aten.split_with_sizes.default",
+                "aten.squeeze.dim",
+                "aten.permute.default",
+                "aten.transpose.int",
+                "aten.view.default",
+                "aten.reshape.default",
+                "aten.index.Tensor",
+                "aten.embedding.default",
+            }
         if args.embedding_quantize:
             llama_instance_list[i].passes_job[I64toI32][
                 QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY
             ]["skip_node"] = {"tokens"}
 
-    if args.ptq:
+    if full_graph_ptq_enabled:
         # 设置量化缓存文件路径
         cache_dir = os.path.join(args.artifact, "quantized_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file = os.path.join(cache_dir, f"quantized_model_{args.ptq}_{args.model_mode}_{args.use_tman}.pt")
+        cache_file = os.path.join(
+            cache_dir,
+            f"quantized_model_{args.ptq}_{args.model_mode}_{args.use_tman}_{args.tman_act_mode}_{args.tman_linear_scope}.pt",
+        )
         
         # 检查是否存在量化缓存
         if os.path.exists(cache_file) and not args.force_quantize:
@@ -891,7 +960,7 @@ def compile(args, pte_filename, tokenizer):
                 compile_spec,
                 dep_table=llama_instance.dep_table,
                 passes_job=llama_instance.passes_job,
-                skip_node_op_set=skip_node_op_set,
+                skip_node_op_set=skip_node_op_set | llama_instance.extra_skip_node_op_set,
             )
             for llama_instance, sample_input, compile_spec in zip(
                 llama_instance_list, sample_inputs_list, compiler_specs
@@ -1303,6 +1372,22 @@ def _build_parser():
         default=None,
         type=str,
         help="Path to external per-channel activation scale pt file for TMAN W4A8.",
+    )
+
+    parser.add_argument(
+        "--tman_act_mode",
+        default="none",
+        choices=["none", "8a"],
+        type=str,
+        help="TMAN activation mode. '8a' means only TMAN target linear layers internally use int8 activations while the surrounding graph stays in its normal PTQ/FP mode.",
+    )
+
+    parser.add_argument(
+        "--tman_linear_scope",
+        default="all",
+        choices=["mlp", "attn", "all"],
+        type=str,
+        help="Which linear groups use TMAN 8a when --tman_act_mode 8a is enabled.",
     )
 
     parser.add_argument(

@@ -72,21 +72,21 @@ GraphStatus tmanfinalizeImpl(TensorType& y,
   const int32_t gemm_m = y.dims()[3];
   const int32_t gemm_n = y.dims()[2];
 
-  const int32_t bits = ((const int32_t*)t_bits.raw_data_const())[0];
   const DType y_dtype = y.get_dtype();
   const int32_t c_elements = c.total_storage_bytes() / sizeof(int32_t);
 
-  if (tman_is_q8_dtype(y_dtype))
+  if (tman_w4a8_has_magic(reinterpret_cast<const int32_t *>(c.raw_data_const()), c_elements))
   {
     // W4A8 新路径：
-    // - 输入 c 中保存的是 int32 中间结果
-    // - 结果已经处于输出 q-domain
-    // - Finalize 仅负责做存储域回写
-    const int32_t storage_zero_point = tman_q8_storage_zero_point(y_dtype);
-    if (tman_w4a8_finalize_to_q8(
+    // - 输入 c 中保存的是浮点域输出结果
+    // - Finalize 只负责把结果写回 fp16 输出张量
+    if (y_dtype != DType::Float16)
+    {
+      return GraphStatus::ErrorDimensions;
+    }
+
+    if (tman_w4a8_finalize_to_fp16(
             gemm_m,
-            y_dtype,
-            storage_zero_point,
             reinterpret_cast<const int32_t *>(c.raw_data_const()),
             c_elements,
             y.raw_data()) != 0)
@@ -101,6 +101,8 @@ GraphStatus tmanfinalizeImpl(TensorType& y,
   {
     return GraphStatus::ErrorDimensions;
   }
+
+  const int32_t bits = ((const int32_t*)t_bits.raw_data_const())[0];
 
   const CType* c_ptr = (const CType*)c.raw_data_const();
   XType* y_ptr       = (XType*)y.raw_data();

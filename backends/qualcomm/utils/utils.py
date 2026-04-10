@@ -232,15 +232,26 @@ class TMANLinear(torch.nn.Module):
         # GPTQv1: AutoGPTQ
         # GPTQv2: GPTQModel
         self.gptq_v2 = qlinear.qzero_format() == 2
-        self.in_features = qlinear.in_features
-        self.out_features = qlinear.out_features // n_splits
-
-        _, _, _, bits, group_size, symmetric = unpack_gptqv2(
+        unpacked_weight, _, _, bits, group_size, symmetric = unpack_gptqv2(
             qlinear.qweight.detach().numpy(),
             qlinear.scales.detach().numpy(),
             qlinear.qzeros.detach().numpy(),
             self.gptq_v2,
         )
+        packed_out_features, packed_in_features = unpacked_weight.shape
+        self.in_features = packed_in_features
+        self.out_features = packed_out_features // n_splits
+        if (
+            qlinear.in_features != self.in_features
+            or qlinear.out_features // n_splits != self.out_features
+        ):
+            warnings.warn(
+                "TMANLinear detected metadata/packed-weight shape mismatch: "
+                f"module reports in/out={qlinear.in_features}/{qlinear.out_features // n_splits}, "
+                f"but packed GPTQ weight resolves to {self.in_features}/{self.out_features}. "
+                "Using packed-weight dimensions for TMAN lowering.",
+                stacklevel=2,
+            )
 
         if n_splits == 1:
             self.qweight = torch.nn.Parameter(qlinear.qweight, requires_grad=False)
@@ -301,19 +312,57 @@ class TMANLinearW4A8(TMANLinear):
         input_scale: torch.Tensor,
         output_scale: torch.Tensor,
         act_dtype: torch.dtype = torch.uint8,
+        module_name: str = "",
     ):
         super().__init__(qlinear)
+        self.module_name = module_name
+
+        def _normalize_scale_length(
+            scale: torch.Tensor,
+            expected: int,
+            scale_name: str,
+        ) -> torch.Tensor:
+            if scale.ndim != 1:
+                raise ValueError(
+                    f"TMANLinearW4A8 expects 1D {scale_name} for '{self.module_name or '<unknown>'}', "
+                    f"but got shape {tuple(scale.shape)}"
+                )
+            if scale.numel() == expected:
+                return scale
+            if scale.numel() == 1:
+                warnings.warn(
+                    f"TMANLinearW4A8 expanding scalar {scale_name} for '{self.module_name or '<unknown>'}' "
+                    f"to length {expected}.",
+                    stacklevel=2,
+                )
+                return scale.expand(expected).clone()
+            if expected % scale.numel() == 0:
+                repeats = expected // scale.numel()
+                warnings.warn(
+                    f"TMANLinearW4A8 tiling {scale_name} for '{self.module_name or '<unknown>'}' "
+                    f"from length {scale.numel()} to {expected} (x{repeats}) to match packed GPTQ weights.",
+                    stacklevel=2,
+                )
+                return scale.repeat(repeats)
+            raise ValueError(
+                f"TMANLinearW4A8 expects {scale_name} of length {expected} for "
+                f"'{self.module_name or '<unknown>'}', but got {scale.numel()}"
+            )
+
+        input_scale = _normalize_scale_length(input_scale, self.in_features, "input_scale")
+        if output_scale.ndim != 1:
+            raise ValueError(
+                f"TMANLinearW4A8 expects 1D output_scale for '{self.module_name or '<unknown>'}', "
+                f"but got shape {tuple(output_scale.shape)}"
+            )
         # input_scale 对应 linear 输入通道维 K；
         # output_scale 对应 linear 输出通道维 M。
+        # 当前导出主路径只强依赖 input_scale 来显式构造 q8 输入，
+        # output_scale 先按外部文件原样保留，供后续 runtime 路径使用。
         if input_scale.ndim != 1 or input_scale.numel() != self.in_features:
             raise ValueError(
                 f"TMANLinearW4A8 expects 1D input_scale of length {self.in_features}, "
                 f"but got shape {tuple(input_scale.shape)}"
-            )
-        if output_scale.ndim != 1 or output_scale.numel() != self.out_features:
-            raise ValueError(
-                f"TMANLinearW4A8 expects 1D output_scale of length {self.out_features}, "
-                f"but got shape {tuple(output_scale.shape)}"
             )
 
         self.act_dtype = act_dtype
@@ -386,6 +435,142 @@ class TMANLinearW4A8(TMANLinear):
             super().extra_repr()
             + f", act_dtype={self.act_dtype}, input_scale_shape={tuple(self.input_scale.shape)}, output_scale_shape={tuple(self.output_scale.shape)}"
         )
+
+
+class TMANLinearW4A8Slice(torch.nn.Module):
+    def __init__(
+        self,
+        source: TMANLinearW4A8,
+        start: int,
+        end: int,
+        module_name: str = "",
+    ):
+        super().__init__()
+        if not isinstance(source, TMANLinearW4A8):
+            raise TypeError(f"Expected TMANLinearW4A8 source, got {type(source)}")
+        if start < 0 or end > source.out_features or start >= end:
+            raise ValueError(
+                f"Invalid TMANLinearW4A8 slice [{start}, {end}) for out_features={source.out_features}"
+            )
+
+        qzero_cols = source.qzeros.shape[1]
+        if qzero_cols <= 0 or source.out_features % qzero_cols != 0:
+            raise ValueError(
+                f"Cannot infer GPTQ pack factor from out_features={source.out_features}, qzeros.shape={tuple(source.qzeros.shape)}"
+            )
+        pack_factor = source.out_features // qzero_cols
+        if start % pack_factor != 0 or end % pack_factor != 0:
+            raise ValueError(
+                f"TMANLinearW4A8 slice [{start}, {end}) is not aligned to pack_factor={pack_factor}"
+            )
+
+        self.in_features = source.in_features
+        self.out_features = end - start
+        self.group_size = source.group_size
+        self.bits = source.bits
+        self.symmetric = source.symmetric
+        self.gptq_v2 = source.gptq_v2
+        self.act_dtype = source.act_dtype
+        self.quant_min = source.quant_min
+        self.quant_max = source.quant_max
+        self.module_name = module_name or f"{getattr(source, 'module_name', 'tman')}.{start}:{end}"
+
+        self.qweight = torch.nn.Parameter(
+            source.qweight[:, start:end].detach().clone(),
+            requires_grad=False,
+        )
+        self.scales = torch.nn.Parameter(
+            source.scales[:, start:end].detach().clone(),
+            requires_grad=False,
+        )
+        self.qzeros = torch.nn.Parameter(
+            source.qzeros[
+                :,
+                start // pack_factor : end // pack_factor,
+            ].detach().clone(),
+            requires_grad=False,
+        )
+        self.g_idx = torch.nn.Parameter(source.g_idx.detach().clone(), requires_grad=False)
+        self.wf_unsqueeze_zero = torch.nn.Parameter(
+            source.wf_unsqueeze_zero.detach().clone(),
+            requires_grad=False,
+        )
+        self.wf_unsqueeze_neg_one = torch.nn.Parameter(
+            source.wf_unsqueeze_neg_one.detach().clone(),
+            requires_grad=False,
+        )
+
+        self.register_buffer(
+            "input_scale",
+            source.input_scale.detach().clone(),
+            persistent=True,
+        )
+        self.register_buffer(
+            "output_scale",
+            source.output_scale[start:end].detach().clone(),
+            persistent=True,
+        )
+        self.register_buffer(
+            "input_zero_points",
+            source.input_zero_points.detach().clone(),
+            persistent=True,
+        )
+
+    def _quantize_input(self, x: torch.Tensor) -> torch.Tensor:
+        axis = x.dim() - 1
+        return torch.ops.quantized_decomposed.quantize_per_channel(
+            x.to(torch.float32),
+            self.input_scale.to(x.device),
+            self.input_zero_points.to(x.device),
+            axis,
+            self.quant_min,
+            self.quant_max,
+            self.act_dtype,
+        )
+
+    def forward(self, x):
+        x_q = self._quantize_input(x)
+        return tman_linear_w4a8(
+            x_q,
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.input_scale,
+            self.output_scale,
+            self.g_idx,
+            self.wf_unsqueeze_zero,
+            self.wf_unsqueeze_neg_one,
+            self.group_size,
+            self.bits,
+            self.symmetric,
+            self.gptq_v2,
+        )
+
+
+def split_tman_linear_w4a8(
+    source: TMANLinearW4A8,
+    split_size: int,
+    num_splits: int,
+    module_name_prefix: str = "",
+) -> torch.nn.ModuleList:
+    if split_size * num_splits != source.out_features:
+        raise ValueError(
+            f"split_tman_linear_w4a8 expects split_size * num_splits == out_features, "
+            f"got {split_size} * {num_splits} != {source.out_features}"
+        )
+    modules = []
+    for i in range(num_splits):
+        start = i * split_size
+        end = start + split_size
+        modules.append(
+            TMANLinearW4A8Slice(
+                source,
+                start,
+                end,
+                module_name=f"{module_name_prefix}.{i}" if module_name_prefix else f"{i}",
+            )
+        )
+    return torch.nn.ModuleList(modules)
 
 
 def _lookup_tman_w4a8_scale_pair(
@@ -494,6 +679,7 @@ def convert_qlinear_to_tman_linear_w4a8(
                         input_scale=input_scale,
                         output_scale=output_scale,
                         act_dtype=act_dtype,
+                        module_name=full_name,
                     ),
                 )
 

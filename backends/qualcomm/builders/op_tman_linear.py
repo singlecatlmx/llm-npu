@@ -10,20 +10,9 @@ import executorch.backends.qualcomm.python.PyQnnWrapperAdaptor as PyQnnWrapper
 
 import numpy as np
 import torch
-from executorch.backends.qualcomm.utils.constants import (
-    QCOM_AXIS,
-    QCOM_DATA,
-    QCOM_DTYPE,
-    QCOM_ENCODING,
-    QCOM_QUANT_ATTRS,
-    QCOM_QUANT_MAX,
-    QCOM_QUANT_MIN,
-    QCOM_SCALES,
-    QCOM_ZERO_POINTS,
-)
+from executorch.backends.qualcomm.utils.constants import QCOM_DATA
 from executorch.backends.qualcomm.builders.utils import unpack_gptqv2, hvx_preprocess_weights, unpack_weights
 import logging
-from executorch.exir.dialects._ops import ops as exir_ops
 
 from .node_visitor import NodeVisitor, register_node_visitor
 from .qnn_constants import (
@@ -91,43 +80,6 @@ def _decide_tile_size(
         logger.warning(f"Can't find optimal tile size that is multiple of {divider} and fits in VTCM, use {res} as workaround")
     return res
 
-def _set_w4a8_output_quant_attrs(
-    node: torch.fx.Node,
-    output_scale: torch.Tensor,
-    act_dtype: torch.dtype = torch.uint8,
-) -> None:
-    # 对 W4A8 路径，我们希望输出张量本身就是“量化张量”。
-    # 因此这里直接覆盖 node.meta 里的量化属性，让 builder 在定义输出
-    # tensor wrapper 时使用外部校准文件给出的 output_scale，而不是沿用
-    # PTQ 自动观察到的默认结果。
-    if output_scale.ndim != 1:
-        raise ValueError(
-            f"TMANLinear W4A8 expects 1D output_scale, got shape {tuple(output_scale.shape)}"
-        )
-    if act_dtype == torch.uint8:
-        quant_min, quant_max = 0, 255
-        zero_point = 128
-    elif act_dtype == torch.int8:
-        quant_min, quant_max = -128, 127
-        zero_point = 0
-    else:
-        raise ValueError(f"Unsupported W4A8 activation dtype for output: {act_dtype}")
-
-    node.meta[QCOM_QUANT_ATTRS] = {
-        QCOM_ENCODING: exir_ops.edge.quantized_decomposed.quantize_per_channel.default,
-        QCOM_DTYPE: act_dtype,
-        QCOM_QUANT_MIN: quant_min,
-        QCOM_QUANT_MAX: quant_max,
-        QCOM_AXIS: len(node.meta["val"].shape) - 1,
-        QCOM_SCALES: output_scale.detach().to(dtype=torch.float32, device="cpu"),
-        QCOM_ZERO_POINTS: torch.full_like(
-            output_scale.detach().to(dtype=torch.float32, device="cpu"),
-            zero_point,
-            dtype=torch.int32,
-        ),
-    }
-
-
 @register_node_visitor
 class TMANLinear(NodeVisitor):
     target = ["tman.linear.default", "tman.linear_w4a8.default", "tman.bitnet_linear.default"]
@@ -142,7 +94,8 @@ class TMANLinear(NodeVisitor):
         nodes_to_wrappers: Dict[str, PyQnnWrapper.TensorWrapper],
     ) -> PyQnnWrapper.PyQnnOpWrapper:
         # 旧 TMANLinear 走 W4A16 路径，需要前后插 Convert；
-        # 新的 tman.linear_w4a8 则直接吃 q8 输入，不再插 Convert。
+        # 新的 tman.linear_w4a8 则直接吃 q8 输入。
+        # 它的内部输出回到浮点域，因此最多只需要补一个“输出侧”的 Convert。
         self.add_convert = node.target.__name__ != "tman.linear_w4a8.default"
         input_node = node.args[0]
         input_tensor = self.get_tensor(input_node, node)
@@ -209,15 +162,6 @@ class TMANLinear(NodeVisitor):
             assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
                 f"TMANLinearW4A8: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
             )
-            # 1. output_scale 用来定义输出张量的量化属性；
-            # 2. 同时把它折叠进预处理后的 weight scale，便于 kernel 直接把
-            #    int32 累加结果落到输出 q-domain。
-            if output_scale_tensor is None:
-                raise ValueError(f"TMANLinearW4A8 missing output_scale tensor for node {node.name}")
-            _set_w4a8_output_quant_attrs(node, output_scale_tensor.detach())
-            # Fold the external output scale into the per-group weight scale so
-            # the kernel can accumulate directly into the output q-domain.
-            scales_repacked = scales_repacked / output_scale_tensor.detach().numpy()[:, None]
         elif node.target.__name__ == "tman.bitnet_linear.default":
             qweight_node = node.args[1]
             qweight_tensor = get_parameter(qweight_node, self.edge_program)
@@ -244,6 +188,10 @@ class TMANLinear(NodeVisitor):
             output_tensor,
             PyQnnWrapper.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
             nodes_to_wrappers,
+        )
+        needs_w4a8_output_convert = (
+            node.target.__name__ == "tman.linear_w4a8.default"
+            and output_tensor.dtype != torch.float16
         )
 
         k = input_tensor.shape[-1]
@@ -350,6 +298,26 @@ class TMANLinear(NodeVisitor):
 
             input_tensor_wrapper = intermediate_input_tensor_wrapper
             output_tensor_wrapper = intermediate_output_tensor_wrapper
+        elif needs_w4a8_output_convert:
+            intermediate_output_tensor_wrapper = self.define_custom_tensor_wrapper(
+                node_name=node.name + "_output_fp16",
+                tensor_type=PyQnnWrapper.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
+                dtype=PyQnnWrapper.Qnn_DataType_t.QNN_DATATYPE_FLOAT_16,
+                quant_encoding=no_quant_encoding,
+                quant_configs=no_quant_configs,
+                dims=output_tensor.size(),
+                tensor=None,
+                is_fake_tensor=True,
+                nodes_to_wrappers=nodes_to_wrappers,
+            )
+            output_convert_op = PyQnnWrapper.PyQnnOpWrapper(
+                node.name + "_output_convert",
+                QNN_OP_PACKAGE_NAME_QTI_AISW,
+                OpConvert.op_name,
+            )
+            output_convert_op.AddInputTensors([intermediate_output_tensor_wrapper])
+            output_convert_op.AddOutputTensors([output_tensor_wrapper])
+            output_tensor_wrapper = intermediate_output_tensor_wrapper
 
         precompute_op = PyQnnWrapper.PyQnnOpWrapper(
             node.name + "_precompute",
@@ -428,4 +396,6 @@ class TMANLinear(NodeVisitor):
 
         if self.add_convert:
             return [input_convert_op, precompute_op, linear_op, finalize_op, output_convert_op]
+        if needs_w4a8_output_convert:
+            return [precompute_op, linear_op, finalize_op, output_convert_op]
         return [precompute_op, linear_op, finalize_op]

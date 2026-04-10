@@ -212,6 +212,9 @@ def annotate_matmul_16a8w(gm: torch.fx.GraphModule) -> None:  # noqa: C901
         while isinstance(node, Node) and node.op == "call_function":
             if node.target in [
                 torch.ops.aten.permute.default,
+                torch.ops.aten.slice.Tensor,
+                torch.ops.aten.slice_copy.Tensor,
+                torch.ops.aten.select.int,
                 torch.ops.aten.squeeze.dim,
                 torch.ops.aten.transpose.int,
                 torch.ops.aten.view.default,

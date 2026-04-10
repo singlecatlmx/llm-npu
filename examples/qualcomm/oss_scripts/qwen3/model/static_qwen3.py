@@ -9,6 +9,10 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_qwen3 import Qwen3Config
+from executorch.backends.qualcomm.utils.utils import (
+    TMANLinearW4A8,
+    split_tman_linear_w4a8,
+)
 from executorch.examples.models.llama.rope import precompute_freqs_cis
 
 
@@ -193,6 +197,38 @@ class Qwen3Attention(nn.Module):
         self.forward_mha = self.forward
         self.forward = self.forward_tman
 
+    def prepare_sha_tman_8a(self):
+        if not all(
+            isinstance(proj, TMANLinearW4A8)
+            for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
+        ):
+            raise TypeError(
+                "prepare_sha_tman_8a expects q/k/v/o projections to be TMANLinearW4A8"
+            )
+
+        self.wq_tman = split_tman_linear_w4a8(
+            self.q_proj,
+            self.head_dim,
+            self.n_heads,
+            module_name_prefix=f"{getattr(self.q_proj, 'module_name', 'q_proj')}.heads",
+        )
+        self.wk_tman = split_tman_linear_w4a8(
+            self.k_proj,
+            self.head_dim,
+            self.n_kv_heads,
+            module_name_prefix=f"{getattr(self.k_proj, 'module_name', 'k_proj')}.heads",
+        )
+        self.wv_tman = split_tman_linear_w4a8(
+            self.v_proj,
+            self.head_dim,
+            self.n_kv_heads,
+            module_name_prefix=f"{getattr(self.v_proj, 'module_name', 'v_proj')}.heads",
+        )
+        self.wo_tman = self.o_proj
+
+        self.forward_mha = self.forward
+        self.forward = self.forward_sha_tman_8a
+
     def forward_tman(
         self,
         hidden_states: torch.Tensor,
@@ -242,6 +278,52 @@ class Qwen3Attention(nn.Module):
 
         y = torch.concat(output_y, dim=-1)
         y = self.o_proj(y)
+
+        if self.output_new_cache_only:
+            return y, k, v
+
+        return y, kh, vh
+
+    def forward_sha_tman_8a(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        atten_mask: torch.Tensor,
+        k_caches: Optional[List[torch.Tensor]] = None,
+        v_caches: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = [wq_tman(hidden_states) for wq_tman in self.wq_tman]
+        k = [wk_tman(hidden_states) for wk_tman in self.wk_tman]
+        v = [wv_tman(hidden_states) for wv_tman in self.wv_tman]
+
+        for i in range(len(q)):
+            q[i] = self.q_norm(q[i])
+            q[i] = apply_rotary_emb_single(q[i], freqs_cos, freqs_sin)
+        for i in range(len(k)):
+            k[i] = self.k_norm(k[i])
+            k[i] = apply_rotary_emb_single(k[i], freqs_cos, freqs_sin).permute(0, 2, 1)
+
+        output_y = []
+        kh, vh = [], []
+        if k_caches and v_caches:
+            for i, _ in enumerate(k_caches):
+                kh.append(torch.cat([k_caches[i], k[i]], dim=-1))
+                vh.append(torch.cat([v_caches[i], v[i]], dim=1))
+        else:
+            kh = k
+            vh = v
+
+        for i, _ in enumerate(q):
+            cache_idx = i // self.num_key_value_groups
+            attn = q[i] @ kh[cache_idx]
+            attn = attn * self.scaling + atten_mask
+            attn = self.attn_softmax(attn)
+            y = attn @ vh[cache_idx]
+            output_y.append(y)
+
+        y = torch.concat(output_y, dim=-1)
+        y = self.wo_tman(y)
 
         if self.output_new_cache_only:
             return y, k, v

@@ -1249,19 +1249,13 @@ try:
 
     @register_annotator([torch.ops.tman.linear_w4a8.default])
     def annotate_tman_linear_w4a8(node: Node, quantization_config: QuantizationConfig) -> None:
-        if _is_annotated([node]):
-            return
-        # W4A8 路径的输入 q8 激活已经在 TMANLinearW4A8.forward 中显式通过
-        # quantize_per_channel 节点构造出来，所以这里主要关心图可见的输出。
+        # W4A8 路径只要求输入激活在图中显式量化成 q8。
+        # 当前更稳的落地方案是让 TMAN 自定义 op 在内部吃 q8 输入，
+        # 但输出仍回到浮点图，避免后续 add/rms_norm/cat/gather 等子图
+        # 继续承受 per-channel q8 中间张量的兼容性压力。
         #
-        # 我们固定给它打上“对称 8bit 激活输出”的标注，确保后续 PTQ / builder
-        # 看到的是一条完整的 W4A8 量化路径。
-        from executorch.backends.qualcomm.quantizer.qconfig import get_8a8w_qnn_ptq_config
-
-        annotate_single_in_single_out(
-            node,
-            get_8a8w_qnn_ptq_config(act_symmetric=True),
-        )
+        # 因此这里不再给 tman.linear_w4a8 本身打“量化输出”标注。
+        return
 
 
     @register_annotator([torch.ops.tman.bitnet_linear.default])

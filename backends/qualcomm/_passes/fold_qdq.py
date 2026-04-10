@@ -19,6 +19,14 @@ class FoldQDQ(ExportPass):
     def __init__(self):
         super(FoldQDQ, self).__init__()
 
+    @staticmethod
+    def _erase_if_unused(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        # Some quant parameters are intentionally shared with downstream ops
+        # such as TMAN W4A8 custom kernels. Leave those nodes in place and let
+        # dead-code elimination clean up only the truly unused ones.
+        if len(node.users) == 0:
+            graph.erase_node(node)
+
     def _fold(self, graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
         # remove dq
         for n in graph_module.graph.nodes:
@@ -54,7 +62,7 @@ class FoldQDQ(ExportPass):
             for user_n in list(n.users.keys()):
                 user_n.replace_input_with(n, n.args[0])
             for n in to_be_removed:
-                graph_module.graph.erase_node(n)
+                self._erase_if_unused(graph_module.graph, n)
 
     def call(self, graph_module: torch.fx.GraphModule):
         self._fold(graph_module)

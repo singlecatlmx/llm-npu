@@ -68,13 +68,12 @@ static HVX_INLINE_ALWAYS void l2fetch(const void *p, uint32_t stride,
 //    约定上游 builder/预处理阶段已经把：
 //    - 激活 per-channel 对称 scale
 //    - 权重 group scale
-//    - 输出 requant scale
 //    折叠进了预处理后的 `scales` 张量中。
 //
 // 3. 为了在不修改旧 scratch buffer 布局的前提下接入新路径：
 //    - Precompute 在 ls[0] 写入 sentinel，告诉后续这是 W4A8 路径
-//    - Linear 在 c 尾部写入 magic，告诉 Finalize 当前 c 中保存的是
-//      “已经处于输出 q-domain 的 int32 中间结果”
+//    - Linear 在 c 尾部写 magic，告诉 Finalize 当前 c 中保存的是
+//      W4A8 路径产生的浮点输出结果
 //
 // 4. 这样设计的目标是：
 //    - 保留原有 W4A16(fp16 内部路径) 不受影响
@@ -219,9 +218,8 @@ static inline float tman_w4a8_read_group_scale(
   // 读取某个 (m, q_group) 对应的 group scale。
   //
   // 这里读取的是 builder 预处理后的“权重 group scale”。
-  // 对 W4A8 路径，builder 还会把 output requant 的逆 scale 折叠进去，
-  // 因此这里读出的 scale 实际上对应：
-  //   weight_group_scale * output_inv_scale
+  // 对当前 W4A8 浮点输出路径，不再额外折叠 output_scale，
+  // 因此这里读出的就是纯粹的 weight_group_scale。
   const int32_t q_tiles = (gemm_k / TMAN_W4A8_G) / TMAN_W4A8_TILE_Q;
   const int32_t q_group_size = group_size / TMAN_W4A8_G;
   const int32_t outputs_per_tile = tile_p / bits;
@@ -381,23 +379,24 @@ static inline int tman_w4a8_linear_from_lut(
   if (c_elements < gemm_m + 2) return -1;
   if (lb[0] != TMAN_W4A8_SENTINEL) return -1;
 
-  // 该函数是新的 W4A8 整数主路径核心：
-  // - 输入：int16 LUT + 预处理后的 4bit weight + 折叠后的 scale
-  // - 中间：纯 int32 累加
-  // - 输出：已经处于“最终输出 q-domain”的 int32 值，存放到 c[0:gemm_m]
+  // 该函数是新的 W4A8 激活路径核心：
+  // - 输入：int16 LUT + 预处理后的 4bit weight + group scale
+  // - 中间：权重点积仍以整数方式构造，但最终按浮点 scale 恢复
+  // - 输出：浮点域结果，存放到 c 的前 gemm_m 个 float 位置
   //
-  // 这里的“输出 q-domain”含义是：
-  //   Finalize 只需要做 clamp + 写回 int8/uint8 存储域，
-  //   不再额外进行一次浮点 requant。
+  // 这样做的目的不是追求最终性能最优，而是先把“q8 输入 + 浮点输出”
+  // 这条更稳的 Transformer 集成路径打通，避免后续 add/rms_norm/cat
+  // 等子图继续承受 q8 中间张量的兼容性压力。
   const int32_t q_group_size = group_size / TMAN_W4A8_G;
   const int32_t q_count = gemm_k / TMAN_W4A8_G;
   const int32_t group_count = q_count / q_group_size;
 
   std::fill(c, c + c_elements, 0);
 
+  float *c_fp = reinterpret_cast<float *>(c);
   for (int32_t m = 0; m < gemm_m; ++m)
   {
-    int64_t accum = 0;
+    float accum = 0.0f;
     for (int32_t group_idx = 0; group_idx < group_count; ++group_idx)
     {
       // 每个 group 都单独读取一份折叠后的 scale。
@@ -440,14 +439,14 @@ static inline int tman_w4a8_linear_from_lut(
       }
 
       // 先恢复 LUT 的真实数值尺度，再乘以 builder 侧预处理好的
-      // weight_group_scale * output_inv_scale。
-      accum += tman_apply_fixed_point_scale(group_dot, act_group_scale * weight_group_scale);
+      // weight_group_scale，直接在浮点域累加。
+      accum += static_cast<float>(group_dot) * act_group_scale * weight_group_scale;
     }
 
-    c[m] = tman_clamp_int32(accum);
+    c_fp[m] = accum;
   }
 
-  // 在 c 末尾写 magic，供 Finalize 判断当前 c 是否来自 W4A8 整数路径。
+  // 在 c 末尾写 magic，供 Finalize 判断当前 c 是否来自 W4A8 浮点输出路径。
   c[c_elements - 2] = TMAN_W4A8_MAGIC0;
   c[c_elements - 1] = TMAN_W4A8_MAGIC1;
   return 0;
@@ -459,38 +458,18 @@ static inline bool tman_w4a8_has_magic(const int32_t *c, int32_t c_elements)
   return c_elements >= 2 && c[c_elements - 2] == TMAN_W4A8_MAGIC0 && c[c_elements - 1] == TMAN_W4A8_MAGIC1;
 }
 
-static inline int tman_w4a8_finalize_to_q8(
+static inline int tman_w4a8_finalize_to_fp16(
     int32_t gemm_m,
-    DType y_dtype,
-    int32_t storage_zero_point,
     const int32_t *c,
     int32_t c_elements,
     void *y)
 {
-  if (!tman_is_q8_dtype(y_dtype) || !tman_w4a8_has_magic(c, c_elements)) return -1;
-
-  // 约定 c[m] 已经是“输出 q-domain”的整数值：
-  // - 对 QInt8：直接 clamp 到 [-128, 127]
-  // - 对 QUInt8：加回存储零点 128，再 clamp 到 [0, 255]
-  //
-  // 这里故意不再做浮点 requant，保持 Finalize 足够简单。
-  if (y_dtype == DType::QUInt8)
-  {
-    uint8_t *y_u8 = reinterpret_cast<uint8_t *>(y);
-    for (int32_t m = 0; m < gemm_m; ++m)
-    {
-      int32_t value = c[m] + storage_zero_point;
-      value = std::max(0, std::min(255, value));
-      y_u8[m] = static_cast<uint8_t>(value);
-    }
-    return 0;
-  }
-
-  int8_t *y_s8 = reinterpret_cast<int8_t *>(y);
+  if (!tman_w4a8_has_magic(c, c_elements)) return -1;
+  const float *c_fp = reinterpret_cast<const float *>(c);
+  __fp16 *y_fp16 = reinterpret_cast<__fp16 *>(y);
   for (int32_t m = 0; m < gemm_m; ++m)
   {
-    int32_t value = std::max(-128, std::min(127, c[m]));
-    y_s8[m] = static_cast<int8_t>(value);
+    y_fp16[m] = static_cast<__fp16>(c_fp[m]);
   }
   return 0;
 }
