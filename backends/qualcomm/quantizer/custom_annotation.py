@@ -232,11 +232,12 @@ def annotate_matmul_16a8w(gm: torch.fx.GraphModule) -> None:  # noqa: C901
                 break
             elif node.target in [
                 torch.ops.tman.linear.default,
+                torch.ops.tman.linear_a8.default,
                 torch.ops.tman.bitnet_linear.default,
                 torch.ops.aten.split_with_sizes.default,
                 operator.getitem,
             ]:
-                # TODO: tman::linear currently does not support 8a
+                # tman::linear_a8 has its own dedicated activation path. Stop propagating here.
                 break
             elif node.target in [torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor]:
                 break

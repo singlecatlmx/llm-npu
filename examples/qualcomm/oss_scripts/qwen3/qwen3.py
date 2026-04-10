@@ -52,6 +52,7 @@ from executorch.backends.qualcomm.utils.utils import (
     convert_linear_to_conv2d,
     convert_linear_to_qlinear,
     convert_qlinear_to_tman_linear,
+    convert_qlinear_to_tman_linear_a8,
     convert_qlinear_to_linear,
     generate_composite_llama_program,
     generate_htp_compiler_spec,
@@ -61,6 +62,7 @@ from executorch.backends.qualcomm.utils.utils import (
     to_edge_transform_and_lower_to_qnn,
     update_spill_fill_size,
 )
+from executorch.backends.qualcomm.utils.tman_w4a8 import ActivationScaleRegistry
 
 from executorch.devtools.backend_debug import print_delegation_info
 from executorch.examples.models.llama.source_transformation.quantize import (
@@ -514,7 +516,10 @@ def compile(args, pte_filename, tokenizer):
     logging.info("📱 === Xiaomi 14 (SM8650) Compilation Configuration ===")
     logging.info(f"🎯 Target: {args.model} ({args.soc_model if hasattr(args, 'soc_model') else 'SM8650'})")
     logging.info(f"🔧 TMAN: {'Enabled' if args.use_tman else 'Disabled'}")
+    logging.info(f"🧠 TMAN activation mode: {args.tman_act_mode}")
     logging.info(f"📊 Quantization: {args.ptq if args.ptq else 'None'}")
+    if args.activation_scales_pt:
+        logging.info(f"📐 Activation scales: {args.activation_scales_pt}")
     
     # 检查QNN OpPackage配置
     qnn_op_paths = os.environ.get('QNN_OP_PACKAGE_PATHS', 'Not set')
@@ -591,6 +596,16 @@ def compile(args, pte_filename, tokenizer):
         device=qcfg.device,
         adapter=qcfg.adapter,
     )
+
+    activation_scale_registry = None
+    if args.use_tman and args.tman_act_mode == "a8":
+        # W4A8 是一条独立支线：linear 的激活量化参数不再来自 observer，
+        # 而是直接来自外部 .pt 文件。这里在编译早期一次性完成加载和覆盖校验。
+        activation_scale_registry = ActivationScaleRegistry.load_activation_scales_pt(
+            args.activation_scales_pt
+        )
+        activation_scale_registry.validate_expected_qwen3_linears(config.num_hidden_layers)
+
     for llama_instance in llama_instance_list:
         for layer in llama_instance.model.layers:
             layer: Qwen3DecoderLayer
@@ -632,11 +647,25 @@ def compile(args, pte_filename, tokenizer):
             )
 
     for llama_instance in llama_instance_list:
-        for layer in llama_instance.model.layers:
+        for layer_idx, layer in enumerate(llama_instance.model.layers):
             if args.use_tman:
-                convert_qlinear_to_tman_linear(layer.self_attn)
+                if args.tman_act_mode == "a8":
+                    # A8 路径下，attention 和 MLP 的目标 qlinear 都会被替换成 TMANLinearA8。
+                    # 这里显式传入模块全路径，供 registry 精确查询 input/output scale。
+                    convert_qlinear_to_tman_linear_a8(
+                        layer.self_attn,
+                        activation_scale_registry,
+                        module_prefix=f"model.layers.{layer_idx}.self_attn",
+                    )
+                    convert_qlinear_to_tman_linear_a8(
+                        layer.mlp,
+                        activation_scale_registry,
+                        module_prefix=f"model.layers.{layer_idx}.mlp",
+                    )
+                else:
+                    convert_qlinear_to_tman_linear(layer.self_attn)
+                    convert_qlinear_to_tman_linear(layer.mlp)
                 layer.self_attn.prepare_tman()
-                convert_qlinear_to_tman_linear(layer.mlp)
             else:
                 convert_qlinear_to_linear(layer.self_attn)
                 layer.self_attn.prepare_sha()
@@ -1231,6 +1260,21 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--tman_act_mode",
+        choices=["a16", "a8"],
+        default="a16",
+        type=str,
+        help="Activation mode for TMAN path. a16 keeps the original W4A16 path; a8 enables the W4A8 extension path.",
+    )
+
+    parser.add_argument(
+        "--activation_scales_pt",
+        default=None,
+        type=str,
+        help="Path to external activation scales .pt file used by the TMAN W4A8 path.",
+    )
+
+    parser.add_argument(
         "--force_quantize",
         action="store_true",
         help="Force re-quantization even if cache exists.",
@@ -1244,6 +1288,15 @@ def _build_parser():
 def export_llama(args) -> None:
     if args.compile_only and args.pre_gen_pte:
         exit("Cannot set both compile_only and pre_gen_pte as true")
+    if args.tman_act_mode == "a8":
+        if not args.use_tman:
+            exit("TMAN W4A8 mode requires --use_tman")
+        if args.activation_scales_pt is None and not args.pre_gen_pte:
+            exit("TMAN W4A8 mode requires --activation_scales_pt")
+        # W4A8 是“TMAN 内部 A8、图外仍 FP16”的专用扩展方案。
+        # 因此这里禁止和现有全图 PTQ 同时开启，避免两套量化语义相互污染。
+        if args.ptq and not args.pre_gen_pte:
+            exit("TMAN W4A8 mode is a dedicated linear extension path and cannot be combined with --ptq")
 
     if args.model_mode == "kv":
         pte_filename = "kv_llama_qnn"

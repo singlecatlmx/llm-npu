@@ -1,4 +1,8 @@
 import torch
+from executorch.backends.qualcomm.utils.tman_w4a8 import (
+    dequantize_gptq_weight,
+    tman_linear_a8_reference,
+)
 from .utils import unpack_weights
 
 
@@ -10,69 +14,19 @@ def _dequantize_weight(
     wf_unsqueeze_zero: torch.Tensor,
     wf_unsqueeze_neg_one: torch.Tensor,
     bits: int,
+    gptq_v2: bool = True,
 ) -> torch.Tensor:
-    """
-    Based on dequantize_weights in gptqmodel/nn_modules/qlinear/__init__.py
-    """
-    import torch as t
-
-    num_itr = 1  # desc_act=False
-    assert(qweight.dtype == t.int32 and qzeros.dtype == t.int32)
-    pack_factor = 32 // bits
-    dequant_dtype = t.int16 if bits == 8 else t.int8
-    maxq = 2 ** bits - 1
-
-    if bits in [2, 4, 8]:
-        zeros = t.bitwise_right_shift(
-            t.unsqueeze(qzeros, 2).expand(-1, -1, pack_factor),
-            wf_unsqueeze_zero  # wf.unsqueeze(0),
-        ).to(dequant_dtype)
-        zeros = t.bitwise_and(zeros, maxq).reshape(scales.shape)
-
-        weight = t.bitwise_and(
-            t.bitwise_right_shift(
-                t.unsqueeze(qweight, 1).expand(-1, pack_factor, -1),
-                wf_unsqueeze_neg_one  # wf.unsqueeze(-1)
-            ).to(dequant_dtype),
-            maxq
-        )
-    elif bits == 3:
-        zeros = qzeros.reshape(qzeros.shape[0], qzeros.shape[1] // 3, 3, 1).expand(
-            -1, -1, -1, 12
-        )
-        zeros = zeros >> wf_unsqueeze_zero  # wf.unsqueeze(0)
-        zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
-        zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
-        zeros = zeros & 0x7
-        zeros = t.cat(
-            [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
-            dim=2,
-        ).reshape(scales.shape)
-
-        weight = qweight.reshape(qweight.shape[0] // 3, 3, 1, qweight.shape[1]).expand(
-            -1, -1, 12, -1
-        )
-        weight = (weight >> wf_unsqueeze_neg_one) & 0x7  # wf.unsqueeze(-1)
-        weight[:, 0, 10] = (weight[:, 0, 10] & 0x3) | ((weight[:, 1, 0] << 2) & 0x4)
-        weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
-        weight = weight & 0x7
-        weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
-    weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
-
-    if num_itr == 1:
-        weights = scales[g_idx.long()] * (weight - zeros[g_idx.long()])
-    else:
-        num_dim = g_idx.shape[0] // num_itr
-        weights = []
-        for i in range(num_itr):
-            scale_i = scales[:, i * num_dim: (i + 1) * num_dim]
-            weight_i = weight[:, i * num_dim: (i + 1) * num_dim]
-            zeros_i = zeros[:, i * num_dim: (i + 1) * num_dim]
-            g_idx_i = g_idx[i * num_dim: (i + 1) * num_dim].long()
-            weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
-        weights = t.cat(weights, dim=1)
-
-    return weights
+    """Compatibility wrapper kept for the existing W4A16 path."""
+    return dequantize_gptq_weight(
+        qweight,
+        scales,
+        qzeros,
+        g_idx,
+        wf_unsqueeze_zero,
+        wf_unsqueeze_neg_one,
+        bits,
+        gptq_v2,
+    )
 
 
 @torch.library.custom_op("tman::linear", mutates_args=())
@@ -100,6 +54,7 @@ def tman_linear(
         wf_unsqueeze_zero,
         wf_unsqueeze_neg_one,
         bits,
+        gptq_v2,
     ).to(x.dtype)
     out = torch.matmul(x, weights).reshape(out_shape)
     return out.to(x.dtype)
@@ -114,6 +69,58 @@ def tman_linear_fake(
     g_idx: torch.Tensor,
     wf_unsqueeze_zero: torch.Tensor,
     wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    out_features = qweight.shape[1]
+    out_shape = x.shape[:-1] + (out_features,)
+    return x.new_zeros(out_shape)
+
+
+@torch.library.custom_op("tman::linear_a8", mutates_args=())
+def tman_linear_a8(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    return tman_linear_a8_reference(
+        x,
+        qweight,
+        scales,
+        qzeros,
+        g_idx,
+        wf_unsqueeze_zero,
+        wf_unsqueeze_neg_one,
+        input_scale,
+        output_scale,
+        bits,
+        gptq_v2,
+    )
+
+
+@tman_linear_a8.register_fake
+def tman_linear_a8_fake(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
     group_size: int,
     bits: int,
     symmetric: bool,

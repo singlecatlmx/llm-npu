@@ -22,15 +22,21 @@ BEGIN_PKG_OPS_OPTS_LIST()
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANPrecompute)
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANLinear)
 DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANFinalize)
+DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANPrecomputeA8)
+DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANLinearA8)
+DECLARE_PKG_OPS_OPTS_LIST(PKG_TMANFinalizeA8)
 
 END_PKG_OPS_OPTS_LIST()
 
 // op package info
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;  // package name passed in as compile flag
 
-static std::array<const char*, 3> sg_opNames{{"TMANLinear",
+static std::array<const char*, 6> sg_opNames{{"TMANLinear",
                                               "TMANFinalize",
-                                              "TMANPrecompute"}};
+                                              "TMANPrecompute",
+                                              "TMANLinearA8",
+                                              "TMANFinalizeA8",
+                                              "TMANPrecomputeA8"}};
 
 static Qnn_ApiVersion_t sg_sdkApiVersion  = QNN_HTP_API_VERSION_INIT;
 static QnnOpPackage_Info_t sg_packageInfo = QNN_OP_PACKAGE_INFO_INIT;
@@ -229,6 +235,21 @@ Qnn_ErrorHandle_t TMANOpPackageValidateOpConfig (Qnn_OpConfig_t opConfig){
           return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
         }
     }
+    else if (std::string(opConfig.v1.typeName) == "TMANLinearA8"){
+        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 3 || opConfig.v1.numOfOutputs != 1){
+          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+        }
+    }
+    else if (std::string(opConfig.v1.typeName) == "TMANFinalizeA8"){
+        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 || opConfig.v1.numOfOutputs != 1){
+          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+        }
+    }
+    else if (std::string(opConfig.v1.typeName) == "TMANPrecomputeA8"){
+        if (opConfig.v1.numOfParams != 3 || opConfig.v1.numOfInputs != 1 || opConfig.v1.numOfOutputs != 1){
+          return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+        }
+    }
     else{
         return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
@@ -284,5 +305,4 @@ Qnn_ErrorHandle_t TMANOpPackageInterfaceProvider(QnnOpPackage_Interface_t* inter
 #ifdef __cplusplus
 }
 #endif
-
 

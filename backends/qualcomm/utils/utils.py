@@ -26,6 +26,7 @@ from executorch.backends.qualcomm.builders.node_visitor import (
 from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.builders.custom_ops import (
     tman_linear,
+    tman_linear_a8,
     tman_bitnet_linear,
 )
 from executorch.backends.qualcomm.builders.utils import unpack_weights, unpack_gptqv2
@@ -54,6 +55,10 @@ from executorch.backends.qualcomm.serialization.qc_schema_serialize import (
 from executorch.backends.qualcomm.utils.constants import (
     QCOM_QNN_COMPILE_SPEC,
     QCOM_QUANTIZED_IO,
+)
+from executorch.backends.qualcomm.utils.tman_w4a8 import (
+    ActivationScaleRegistry,
+    validate_w4a8_target_config,
 )
 
 from executorch.exir import (
@@ -280,6 +285,127 @@ class TMANLinear(torch.nn.Module):
         return s.format(**self.__dict__)
 
 
+class TMANLinearA8(torch.nn.Module):
+    def __init__(
+        self,
+        qlinear: torch.nn.Module,
+        input_scale: torch.Tensor,
+        output_scale: torch.Tensor,
+        n_splits: int = 1,
+    ):
+        super().__init__()
+        # 这里沿用 GPTQ qlinear 中已经准备好的权重打包张量，
+        # 只额外给 W4A8 路径补充输入/输出激活 scale。
+        #
+        # 设计意图：
+        # 1. 不破坏旧的 TMANLinear / W4A16 路径；
+        # 2. 让 export 图中能明确区分 tman::linear 和 tman::linear_a8；
+        # 3. 把外部 scale 文件提供的量化参数固定在模块里，避免依赖 observer。
+        self.gptq_v2 = qlinear.qzero_format() == 2
+        self.in_features = qlinear.in_features
+        self.out_features = qlinear.out_features // n_splits
+
+        _, _, _, bits, group_size, symmetric = unpack_gptqv2(
+            qlinear.qweight.detach().numpy(),
+            qlinear.scales.detach().numpy(),
+            qlinear.qzeros.detach().numpy(),
+            self.gptq_v2,
+        )
+        # A8 支线当前明确是目标专用实现，而不是“任意 bits/group_size 的泛化接口”。
+        # 这里在模块构造期就收紧配置，可以尽早暴露：
+        # - 权重文件配置不符
+        # - 转换链路误接到非目标 linear
+        # - 后续 builder/runtime 对配置理解不一致
+        try:
+            validate_w4a8_target_config(bits, group_size, symmetric)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if n_splits == 1:
+            # 直接复用 GPTQ qlinear 中已有的静态张量。
+            # 对当前项目来说，这比重新拷贝/重排更稳妥：
+            # - export 时参数名更稳定
+            # - builder 仍能从原始 GPTQ 张量恢复所需布局
+            # - 不会破坏旧路径对这些张量的理解
+            self.qweight = torch.nn.Parameter(qlinear.qweight, requires_grad=False)
+            self.scales = torch.nn.Parameter(qlinear.scales, requires_grad=False)
+            self.qzeros = torch.nn.Parameter(qlinear.qzeros, requires_grad=False)
+        else:
+            # 多分片场景当前不是 A8 主路径，但这里仍保留和旧代码一致的接口形态，
+            # 方便后续若需要继续做 split/fallback 时不必重塑模块 API。
+            self.qweight = torch.nn.Parameter(
+                qlinear.qweight.new_zeros(
+                    (qlinear.qweight.shape[0], qlinear.qweight.shape[1] // n_splits)
+                ),
+                requires_grad=False,
+            )
+            self.scales = torch.nn.Parameter(
+                qlinear.scales.new_zeros(
+                    (qlinear.scales.shape[0], qlinear.scales.shape[1] // n_splits)
+                ),
+                requires_grad=False,
+            )
+            self.qzeros = torch.nn.Parameter(
+                qlinear.qzeros.new_zeros(
+                    (qlinear.qzeros.shape[0], qlinear.qzeros.shape[1] // n_splits)
+                ),
+                requires_grad=False,
+            )
+
+        self.g_idx = torch.nn.Parameter(qlinear.g_idx, requires_grad=False)
+        self.wf_unsqueeze_zero = torch.nn.Parameter(
+            qlinear.wf_unsqueeze_zero, requires_grad=False
+        )
+        self.wf_unsqueeze_neg_one = torch.nn.Parameter(
+            qlinear.wf_unsqueeze_neg_one, requires_grad=False
+        )
+        self.input_scale = torch.nn.Parameter(
+            input_scale.detach().reshape(1).to(torch.float32), requires_grad=False
+        )
+        self.output_scale = torch.nn.Parameter(
+            output_scale.detach().reshape(1).to(torch.float32), requires_grad=False
+        )
+
+        self.group_size = group_size
+        self.bits = bits
+        self.symmetric = symmetric
+        self.act_quant_min = -127
+        self.act_quant_max = 127
+
+    def forward(self, x):
+        # 对外仍暴露“输入 FP tensor -> 输出 FP tensor”的接口，
+        # 具体 INT8 量化边界、effective scale 折叠、以及 runtime A8 三段式 op，
+        # 都由 custom op + builder + runtime 共同完成。
+        #
+        # 也就是说：
+        # - 模块层只负责携带静态事实（GPTQ 权重、input/output scale、元信息）；
+        # - 真正的图边界量化 / QNN lowering / OpPackage 执行细节，
+        #   都被下沉到后续各层。
+        return tman_linear_a8(
+            x,
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.g_idx,
+            self.wf_unsqueeze_zero,
+            self.wf_unsqueeze_neg_one,
+            self.input_scale,
+            self.output_scale,
+            self.group_size,
+            self.bits,
+            self.symmetric,
+            self.gptq_v2,
+        )
+
+    def extra_repr(self):
+        return (
+            f"{self.in_features}, {self.out_features}, group_size={self.group_size}, "
+            f"bits={self.bits}, symmetric={self.symmetric}, "
+            f"input_scale={float(self.input_scale.item()):.8f}, "
+            f"output_scale={float(self.output_scale.item()):.8f}"
+        )
+
+
 def convert_qlinear_to_tman_linear(module: torch.nn.Module):
     # 动态导入gptqmodel组件以避免循环导入问题
     try:
@@ -313,6 +439,73 @@ def convert_qlinear_to_tman_linear(module: torch.nn.Module):
         return module
 
     return replace_qlinear(module)
+
+
+def convert_qlinear_to_tman_linear_a8(
+    module: torch.nn.Module,
+    scale_registry: ActivationScaleRegistry,
+    module_prefix: str,
+):
+    try:
+        import importlib
+
+        qlinear_base_module = importlib.import_module("gptqmodel.nn_modules.qlinear")
+        BaseQuantLinear = getattr(qlinear_base_module, "BaseQuantLinear")
+        torch_qlinear_module = importlib.import_module(
+            "gptqmodel.nn_modules.qlinear.torch"
+        )
+        TorchQuantLinear = getattr(torch_qlinear_module, "TorchQuantLinear")
+    except ImportError as e:
+        try:
+            from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+        except ImportError as e2:
+            raise RuntimeError(
+                f"无法导入gptqmodel组件: 动态导入失败({e}), 直接导入失败({e2})"
+            )
+
+    def replace_qlinear(curr_module: torch.nn.Module, curr_prefix: str):
+        # 这里使用“模块全路径”去查外部 scale。
+        # 例如：
+        #   curr_prefix = model.layers.0.self_attn
+        #   attr_str = q_proj
+        # 则最终查到：
+        #   model.layers.0.self_attn.q_proj
+        #
+        # 这样做的好处是替换逻辑和 scale 文件解耦，只依赖统一规范化后的路径。
+        attr_strs = dir(curr_module)
+        if isinstance(curr_module, torch.nn.ModuleList):
+            attr_strs += [str(i) for i in range(len(curr_module))]
+
+        for attr_str in attr_strs:
+            target_attr = getattr(curr_module, attr_str)
+            module_path = f"{curr_prefix}.{attr_str}" if curr_prefix else attr_str
+            if isinstance(target_attr, BaseQuantLinear):
+                if not isinstance(target_attr, TorchQuantLinear):
+                    raise RuntimeError("Only GPTQ TorchQuantLinear backend is supported")
+                # 一旦某个目标 linear 缺失 scale，就在这里快速失败。
+                # 我们不允许 silently fallback，否则后续数值行为会变得不可控。
+                linear_scales = scale_registry.get_linear_scales(module_path)
+                target_attr.post_init()
+                # 模块替换是 A8 编译链路里最早的“语义切换点”：
+                # 从这一行开始，这个 linear 在导出图中会变成 `tman::linear_a8`，
+                # 后续 builder/runtime 也会完全走 A8 专用支线。
+                setattr(
+                    curr_module,
+                    attr_str,
+                    TMANLinearA8(
+                        target_attr,
+                        input_scale=linear_scales.input_scale,
+                        output_scale=linear_scales.output_scale,
+                    ),
+                )
+
+        for child_name, sub_module in curr_module.named_children():
+            child_prefix = f"{curr_prefix}.{child_name}" if curr_prefix else child_name
+            replace_qlinear(sub_module, child_prefix)
+        return curr_module
+
+    return replace_qlinear(module, module_prefix)
 
 
 # https://github.com/huggingface/transformers/pull/37742
