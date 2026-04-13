@@ -135,28 +135,6 @@ Error Runner::load() {
   int64_t head_dim = method_meta.output_tensor_meta(1)->sizes()[1]; // k_cache
   int64_t num_heads = (method_meta.num_outputs() - 1) / (num_layers * 2);
   vocab_size_ = method_meta.output_tensor_meta(0)->sizes()[2]; // logit_tensor
-  auto logits_scalar_type = method_meta.output_tensor_meta(0)->scalar_type();
-  auto kv_attention_mask_scalar_type = method_meta.input_tensor_meta(1)->scalar_type();
-
-  if (logits_scalar_type == executorch::aten::ScalarType::Float) {
-    kv_type_ = "float32";
-  } else if (logits_scalar_type == executorch::aten::ScalarType::UInt16) {
-    kv_type_ = "uint16";
-  } else {
-    ET_CHECK_MSG(
-        false,
-        "Unsupported logits scalar_type (%d) in qnn_llama_runner. "
-        "Current runner supports only Float/UInt16 logits.",
-        static_cast<int>(logits_scalar_type));
-  }
-
-  ET_CHECK_MSG(
-      kv_attention_mask_scalar_type == executorch::aten::ScalarType::UInt16,
-      "Unsupported kv attention mask scalar_type (%d). "
-      "Current qnn_llama_runner/io_manager assumes UInt16 mask buffers. "
-      "This commonly happens in non-PTQ INT8/TMAN A8 export paths and can lead to SIGSEGV.",
-      static_cast<int>(kv_attention_mask_scalar_type));
-
   use_int64_token_ = method_meta.input_tensor_meta(0)->scalar_type() ==
       executorch::aten::ScalarType::Long;
   ET_CHECK_MSG(num_layers != -1, "Could not retrieve num layers");
