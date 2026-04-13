@@ -1,7 +1,3 @@
-//==============================================================================
-// Auto Generated Code for TMANOpPackage
-//==============================================================================
-
 #include "HTP/core/constraints.h"
 #include "HTP/core/op_package_feature_support.h"
 #include "HTP/core/op_register_ext.h"

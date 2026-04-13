@@ -94,7 +94,16 @@
 为了降低 QNN / OpPackage 真编译阶段的 rank/schema 风险，当前 builder/runtime 对外 ABI 已重新压回 4D packed：
 
 - qweight ABI:
-  - `[1, M, G, qgroup_vector_blocks * (4 * bits)]`
+  - 逻辑字节布局仍等价于：
+    `[1, M, G, qgroup_vector_blocks * (4 * bits bytes)]`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, G, 32]` 的 `int32`
+- effective scales ABI:
+  - 逻辑语义仍是 group-wise `float32 effective_scale`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, 1, padded_num_groups]` 的 `int32`
+  - raw bytes 仍按 `float32*` 解释
+  - 每个 output row 已 pad 到 `128B`
 - LUT scratch ABI:
   - `[1, row, group, qgroup_vector_blocks * (4 * 16)]`
 
@@ -102,6 +111,19 @@
 
 - helper kernel 内部继续按 block / vector-line 逻辑消费；
 - QNN schema / graph compile 阶段继续看到 4D packed tensor。
+
+### 3.3 当前设备侧证据边界
+
+当前需要特别强调：
+
+- 目前能直接代表 `W4A8` 现场问题的，只是 `logs/w4a8/` 下由合作者提供的运行日志；
+- `logs/w4a16/` 下的日志以及旧 `W4A16` 路径历史产物，只能作为参考旧路径 transport/ABI 风格的对照；
+- 它们不能直接证明当前最新 `W4A8` 图已如何落图，也不能直接证明当前最新 A8 修改已经生效。
+
+因此，当前交付更准确的含义是：
+
+- 这是一版“适合重新生成 W4A8 `.pte`、重编 `TMANOpPackage` 并再次上机验证”的交付；
+- 不是一版“已经确认修复设备侧段错误”的最终交付。
 
 ## 4. W4A16 与当前 W4A8 链路对比
 
@@ -221,6 +243,17 @@ python examples/qualcomm/oss_scripts/qwen3/qwen3.py \
   - `*_quant_attrs.txt`
   是否成功生成
 
+### 5.4 重新验证前的关键要求
+
+如果要验证最新代码里的 A8 ABI/alignment 修改，合作者必须同时完成下面几件事：
+
+- 重新生成新的 `W4A8 .pte`
+- 重新编译新的 `libQnnTMANOpPackage.so`
+- 不要复用旧的 `W4A8` context / restore / cache 产物
+- 设备上旧的 `pte`、旧的 op package 和旧的 QNN restore/cache 目录应先清理，再做 rerun
+
+否则，新旧 ABI 混用会让运行结果失去解释力。
+
 ## 6. 交付检查项
 
 建议其它合作者按下面顺序检查：
@@ -262,6 +295,17 @@ python examples/qualcomm/oss_scripts/qwen3/qwen3.py \
   - graph prepare failure
   - obvious tensor rank mismatch
 
+### 6.5 建议回传的现场证据
+
+建议合作者在下一轮 rerun 后至少回传：
+
+- 新生成的 `W4A8` compile-only 日志
+- 新编译 `TMANOpPackage` 的构建日志
+- 新的设备运行日志
+- 若仍崩溃，则提供新的 Android tombstone / crash backtrace
+
+只有这些“新一轮 W4A8 产物 + 新日志”才能用于判断当前 ABI/alignment 修改是否真正命中问题。
+
 ## 7. 已知风险
 
 当前代码已经适合做阶段性交付，但仍存在下面这些已知风险：
@@ -273,6 +317,20 @@ python examples/qualcomm/oss_scripts/qwen3/qwen3.py \
 - 还没有在本机完成 compile-only 真验证
 - 还没有在本机完成 OpPackage 真编译
 - 还没有在本机完成 device smoke test
+
+### 7.1.1 当前外部现场日志仍显示设备侧段错误
+
+当前合作者提供的 `logs/w4a8/` 日志表明：
+
+- `W4A8` 路径在设备运行阶段仍存在段错误
+
+最新代码已经围绕：
+
+- static qweight/effective scales 的 transport 容器
+- 每行 `128B` 对齐
+- HVX 直访存对齐保护
+
+做了进一步收紧，但这些修改尚未被新一轮 W4A8 rerun 证实。
 
 ### 7.2 `LinearA8` 仍未达到原 `W4A16 hvx_tbl(...)` 的成熟程度
 
@@ -309,7 +367,7 @@ python examples/qualcomm/oss_scripts/qwen3/qwen3.py \
 - `python tools/tman_w4a8_reference_check.py` 通过
 - scale 审计和模型切片审计通过当前口径
 - OpPackage schema / builder / runtime op / qwen3 A8 入口都已接通
-- 对外 ABI 已采用 4D packed 形态，适合做 QNN 真编译验证
+- 对外 ABI 已采用更保守的 4D packed + int32 transport 容器形态，适合继续做 QNN 真编译与 rerun 验证
 
 ### 8.2 最终交付通过
 
@@ -329,7 +387,10 @@ python examples/qualcomm/oss_scripts/qwen3/qwen3.py \
 - A8 入口、builder、runtime op、注册、XML schema 都已经接通
 - A8 路径当前已明确收敛到真实目标配置
 - 轻量 Python/reference 验证已经稳定通过
-- 对外 ABI 已采用更稳妥的 4D packed 形态，降低了 QNN 编译阶段的 rank/schema 风险
+- 对外 ABI 已进一步向旧 `W4A16` transport 风格收紧：
+  - qweight / effective_scales 都通过 `int32` 容器承载
+  - effective scales 每行 pad 到 `128B`
+  - helper 中已加入 HVX 对齐保护
 
 但当前仍不应宣称：
 

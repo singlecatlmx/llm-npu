@@ -169,7 +169,7 @@
             <Input>
                 <Name>qweight</Name>
                 <Mandatory>true</Mandatory>
-                <Datatype>QNN_DATATYPE_UINT_8</Datatype>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
                 <Shape>
                     <Rank>4D</Rank>
                     <Layout>NHWC</Layout>
@@ -179,7 +179,7 @@
             <Input>
                 <Name>scales</Name>
                 <Mandatory>true</Mandatory>
-                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
                 <Shape>
                     <Rank>4D</Rank>
                     <Layout>NHWC</Layout>

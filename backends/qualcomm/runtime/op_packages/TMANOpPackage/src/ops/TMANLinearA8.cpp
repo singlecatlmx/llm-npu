@@ -1,7 +1,3 @@
-//==============================================================================
-// Auto Generated Code for TMANOpPackage
-//==============================================================================
-
 #include "HTP/core/constraints.h"
 #include "HTP/core/op_package_feature_support.h"
 #include "HTP/core/op_register_ext.h"
@@ -86,20 +82,23 @@ GraphStatus tmanlineara8Impl(TensorType& c,
 
   auto qweight_dims = qweight.dims();
   // 当前 qweight 对外 ABI 已压回 4D packed：
-  // [1, M, G, qgroup_vector_blocks * (4 * bits)]
-  // 这里先从最后一维恢复出 qgroup_vector_blocks，再继续做 layout 推导。
+  // [1, M, G, packed_int32]
+  // 其中最后一维虽然以 int32 容器承载，但 raw bytes 仍然是：
+  //   qgroup_vector_blocks * (4 * bits)
+  // 这里先把最后一维换算回真实字节数，再恢复 qgroup_vector_blocks。
   if (qweight_dims.size() != 4 ||
       (int32_t)qweight_dims[0] != 1 ||
       (int32_t)qweight_dims[1] != gemm_m) {
     return GraphStatus::ErrorFatal;
   }
   const int32_t num_groups = (int32_t)qweight_dims[2];
-  const int32_t packed_weight_values = (int32_t)qweight_dims[3];
-  if (packed_weight_values % TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK != 0) {
+  const int32_t packed_weight_int32 = (int32_t)qweight_dims[3];
+  const int32_t packed_weight_bytes = packed_weight_int32 * (int32_t)sizeof(int32_t);
+  if (packed_weight_bytes % TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK != 0) {
     return GraphStatus::ErrorFatal;
   }
   const int32_t qgroup_vector_blocks =
-      packed_weight_values / TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK;
+      packed_weight_bytes / TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK;
   const int32_t qgroups_per_group = qgroup_vector_blocks * TMAN_A8_QGROUPS_PER_VECTOR;
   const int32_t gemm_k = num_groups * qgroups_per_group * 4;
   if (gemm_k % 4 != 0 || group_size % 4 != 0) {
@@ -132,13 +131,16 @@ GraphStatus tmanlineara8Impl(TensorType& c,
   if (scales_dims.size() != 4 ||
       (int32_t)scales_dims[0] != 1 ||
       (int32_t)scales_dims[1] != gemm_m ||
-      (int32_t)scales_dims[2] != num_groups ||
-      (int32_t)scales_dims[3] != 1) {
+      (int32_t)scales_dims[2] != 1 ||
+      (int32_t)scales_dims[3] < num_groups ||
+      (((int32_t)scales_dims[3] * (int32_t)sizeof(float)) % 128) != 0) {
     return GraphStatus::ErrorFatal;
   }
+  layout.scale_row_stride = (int32_t)scales_dims[3];
 
   const int16_t* l_ptr = (const int16_t*)l.raw_data_const();
   const uint8_t* idx_ptr = (const uint8_t*)qweight.raw_data_const();
+  // `scales` 在 schema/transport 上按 int32 容器承载，但 raw bytes 仍然是 float32。
   const float* s_ptr = (const float*)scales.raw_data_const();
   float* c_ptr = (float*)c.raw_data();
   tman_a8_linear_scalar(

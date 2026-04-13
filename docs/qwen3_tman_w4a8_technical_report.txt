@@ -1,0 +1,147 @@
+Qwen3 TMAN W4A8 阶段性技术汇报
+
+一、项目背景与目标
+
+本项目基于 ExecuTorch、Qualcomm QNN backend 和自定义 TMANOpPackage，面向 Qwen3-1.7B 的端侧推理场景，推进 GPTQ W4 权重下的高效 linear 加速实现。原有工程已经具备一条可工作的 W4A16 TMAN 路径，即权重保持低比特查表思路，激活侧仍按 A16/FP16 语义处理。
+
+本阶段的核心目标，是在不破坏原有 W4A16 路径的前提下，为 Qwen3 decoder 内部 7 类关键 linear 新增一条 W4A8 支线。也就是说，继续保持 GPTQ W4 权重不变，把 linear 激活改造为 INT8 量化推理，同时保证非 linear 算子仍然维持原有 FP16 计算路径。
+
+二、当前代码状态
+
+当前仓库已经不是“只有设计文档”的阶段，而是已经具备一条完整的 W4A8 baseline 支线：
+
+- `qwen3.py` 已支持 `--tman_act_mode a8` 和 `--activation_scales_pt`
+- 外部 activation scale 的 registry、路径规范化和覆盖校验已实现
+- Python 模块层已实现 `TMANLinearA8`
+- 导出层已实现 `tman::linear_a8`
+- builder 已实现 `op_tman_linear_a8.py`
+- runtime 已实现 `TMANPrecomputeA8 / TMANLinearA8 / TMANFinalizeA8`
+- helper kernel 已统一收敛到 `hvx_funcs.h`
+
+因此，当前主要风险已不再是“W4A8 功能还没写出来”，而是“W4A8 在真实 QNN/HTP 设备环境中的 ABI、alignment 和 transport 是否稳定”。
+
+三、当前总体技术路线
+
+当前已经明确采用“保留旧路径，新增支线”的技术路线。原有 W4A16 路径保持不动，继续作为稳定参考；W4A8 路径独立承载激活 INT8 化的语义和实现。
+
+在整条链路上，当前 W4A8 方案沿用 TMAN 的三段式组织方式：
+
+- `TMANPrecomputeA8`
+- `TMANLinearA8`
+- `TMANFinalizeA8`
+
+图外部继续保持 FP16 数据流，进入 linear 前通过显式 `Convert` 量化到 INT8，linear 内部执行 W4A8 计算，完成后再转换回 FP16 供后续非 linear 算子继续使用。
+
+四、当前已经完成的编译与 lowering 工作
+
+当前 builder 已经能把 Python 图中的 `tman::linear_a8` lower 成一条专用的 QNN 子图序列，即：
+
+- 输入量化 `Convert`
+- `TMANPrecomputeA8`
+- `TMANLinearA8`
+- `TMANFinalizeA8`
+- 输出反量化 `Convert`
+
+同时，builder 会把：
+
+- weight scale
+- input activation scale
+- output activation scale
+
+折叠成 runtime 更易消费的 `effective_scale` 表示，从而让 linear kernel 内部保持更清晰的 group-wise 缩放路径。
+
+五、当前 static tensor / ABI 收敛
+
+当前 W4A8 runtime 在逻辑语义上仍按 block / vector-line 理解数据：
+
+- qweight logical：
+  - `[M, G, Qg, bits]`
+- LUT scratch logical：
+  - `[row, group, qgroup_in_group, 16]`
+
+为了降低 QNN / OpPackage 真编译阶段的 rank/schema 风险，当前 builder/runtime 对外 ABI 已重新压回 4D packed 形态，并在最近一轮修改中继续向旧 W4A16 transport 风格收紧：
+
+- qweight：
+  - raw bytes 逻辑上仍等价于 `[1, M, G, qgroup_vector_blocks * (4 * bits bytes)]`
+  - 当前 schema/transport 容器为 `[1, M, G, 32]` 的 `int32`
+  - runtime 仍按 `uint8*` 解释 raw bytes
+- effective scales：
+  - 逻辑语义仍是 group-wise `float32 effective_scale`
+  - 当前 schema/transport 容器为 `[1, M, 1, padded_num_groups]` 的 `int32`
+  - runtime 仍按 `float32*` 解释 raw bytes
+  - 每个 output row 已 pad 到 `128B`
+- LUT scratch：
+  - 继续保持 `[1, row, group, qgroup_vector_blocks * (4 * 16)]`
+
+这说明当前 W4A8 已开始显式把：
+
+- 数学语义
+- transport 容器
+- HTP 对齐习惯
+
+三者分层处理，而不是继续把“逻辑正确”直接等同于“设备端一定安全”。
+
+六、当前 kernel 与 runtime 收敛
+
+当前 kernel 的一个重要进展，是已经不再停留在最早的纯标量 baseline，而是开始具备更清晰的 block、tile 和 vector-line 组织方式。也就是说，激活侧已经按 4 个激活构造 16 项 LUT，多个 qgroup 被组织成 128B block，与 HVX vector line 的粒度对齐。
+
+此外，当前 helper kernel 又完成了一轮设备稳定性收敛：
+
+- 新增 `tman_a8_is_vector_aligned(...)`
+- LUT block 的 HVX load/store 只有在满足 vector-line 对齐时才走直访存
+- `FinalizeA8` 的 HVX pack 路径只有在输入和输出 block 都满足对齐时才启用
+- 否则自动回退到 `memcpy` / scalar fallback
+
+这说明当前 A8 helper 已经不再默认假设：
+
+- 所有 scratch / output pointer 都天然满足 HVX 直访存对齐
+
+而是开始明确做“满足对齐时走快路径，不满足时走保守路径”的收敛。
+
+七、当前验证情况
+
+在当前机器没有完整 ExecuTorch/QNN 运行环境的前提下，项目已经建立了较完整的轻量验证体系，包括：
+
+- `python backends/qualcomm/tests/test_tman_w4a8.py`
+- `python tools/tman_w4a8_reference_check.py`
+- `python tools/tman_w4a8_qwen3_scale_audit.py ...`
+- `python tools/tman_w4a8_model_slice_audit.py ...`
+
+当前可确认的结论包括：
+
+- `test_tman_w4a8.py` 已通过 `18` 个轻量测试
+- scale 文件覆盖完整，目标 linear 范围清晰
+- `runtime baseline == grouped reference`
+- 与更高层 `high-level reference` 相比，仍有极少数 `1 个 INT8 bin` 级差异，但这已被识别为参考口径差异，而不是当前 runtime baseline 的直接逻辑错误
+
+八、当前设备侧状态边界
+
+当前需要特别强调的一点是：
+
+- 目前能直接代表 W4A8 设备现场问题的，只有 `logs/w4a8/` 下由合作者提供的运行日志
+- `logs/w4a16/` 下的历史日志、以及旧路径生成的 `.pte` / `quant_attrs` / 其它产物，只能作为旧路径参考
+- 它们可以帮助我们理解旧 W4A16 的 transport/ABI 风格，但不能直接证明当前 W4A8 图已如何落图，也不能直接证明最新 W4A8 修改已经生效
+
+当前合作者提供的 W4A8 现场日志显示：
+
+- graph 已进入运行阶段
+- 设备侧仍存在段错误
+- 从现象上看，问题更像是 runtime transport / alignment / static tensor ABI 风险，而不是高层数学语义错误
+
+九、当前阶段性判断
+
+从整体项目节奏看，当前已经不是“纯设计阶段”，也不是“只有 Python 参考实现”的阶段，而是已经具备一条可运行、可验证、并且已经开始围绕真实设备侧风险做 ABI/alignment 收紧的 W4A8 支线。
+
+更准确的阶段判断是：
+
+- 当前代码已适合交给合作者继续做下一轮 compile-only、OpPackage 真编译和 device rerun
+- 但当前还不能宣称 device-side 段错误已经被修复
+- 是否真正命中问题，必须以新一轮 W4A8 `.pte`、新编译的 `TMANOpPackage` 和新的设备日志为准
+
+十、后续工作方向
+
+后续工作建议继续分两条主线推进。
+
+第一条主线是工程验证主线，即在完整 ExecuTorch/QNN/Hexagon 环境中重新生成 W4A8 `.pte`、重编 `TMANOpPackage`，并完成 device rerun，确认当前最新 ABI/alignment 收敛是否命中设备侧段错误。
+
+第二条主线是 kernel 优化主线，即在当前已经完成的 tile、block、部分 HVX 化和对齐保护基础上，继续推动 `LinearA8` 和 `FinalizeA8` 向更完整的 HVX intrinsic 实现演进，让当前方案更接近最终的高性能设备侧执行形态。

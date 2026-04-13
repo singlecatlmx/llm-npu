@@ -20,6 +20,7 @@ TMAN_A8_TARGET_QGROUPS_PER_GROUP = TMAN_A8_TARGET_GROUP_SIZE // TMAN_A8_LUT_GROU
 TMAN_A8_TARGET_QGROUP_VECTOR_BLOCKS = (
     TMAN_A8_TARGET_QGROUPS_PER_GROUP // TMAN_A8_QGROUPS_PER_VECTOR
 )
+TMAN_A8_QNN_STATIC_ALIGNMENT_BYTES = 128
 
 
 EXPECTED_QWEN3_LINEAR_NAMES = (
@@ -368,6 +369,12 @@ def fold_weight_scales_for_w4a8(
     )
 
 
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError(f"alignment must be positive, got {alignment}")
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def prepare_w4a8_baseline_runtime_tensors(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -537,6 +544,76 @@ def pack_w4a8_weight_lut_indices_for_qnn(
         packed_hvx.shape[1],
         packed_hvx.shape[2] * packed_hvx.shape[3],
     ).contiguous()
+
+
+def pack_w4a8_weight_lut_indices_for_qnn_int32(
+    qweight_lut_indices_mgqb: torch.Tensor,
+    bits: int,
+    qgroups_per_vector: int = TMAN_A8_QGROUPS_PER_VECTOR,
+) -> torch.Tensor:
+    # HTP 上自定义 static tensor 的 transport/prepare 对齐通常比 Python reference 更敏感。
+    # 这里沿着旧 W4A16 的思路，把原始字节保持不变，只是把 128B 对齐的一行 qweight
+    # 重新解释成 int32 容器：
+    #   [1, M, G, 128 bytes] -> [1, M, G, 32 int32]
+    #
+    # runtime 侧仍然把 raw_data() 当作 uint8* 读取，因此数学语义不变；
+    # 但 QNN/HTP 看到的是 4B 对齐的 static tensor，更接近旧路径的物理承载方式。
+    packed_qnn_u8 = pack_w4a8_weight_lut_indices_for_qnn(
+        qweight_lut_indices_mgqb,
+        bits,
+        qgroups_per_vector=qgroups_per_vector,
+    )
+    int32_elem_size = torch.tensor([], dtype=torch.int32).element_size()
+    if packed_qnn_u8.shape[-1] % int32_elem_size != 0:
+        raise ValueError(
+            "Packed qweight last dim must be divisible by sizeof(int32), "
+            f"got {packed_qnn_u8.shape[-1]}"
+        )
+    return packed_qnn_u8.view(torch.int32)
+
+
+def pack_w4a8_effective_scales_for_qnn(
+    effective_scales_mg: torch.Tensor,
+    alignment_bytes: int = TMAN_A8_QNN_STATIC_ALIGNMENT_BYTES,
+) -> torch.Tensor:
+    # 旧 W4A16 路径里的静态 scale buffer 天然是“大行连续存储”，
+    # 不会出现当前 A8 这种最后一维只有 1 个 float 的 4D 形态。
+    #
+    # 为了让 A8 更接近旧路径的 HTP 访存习惯，这里把 effective scales 打包成：
+    #   [1, M, 1, padded_num_groups]
+    # 并把每一行的字节数 pad 到 128B 的整数倍。
+    #
+    # runtime 只消费前 num_groups 个有效值，padding 区域保持 0 即可。
+    if effective_scales_mg.dim() != 2:
+        raise ValueError(
+            "Expected effective_scales shaped as [M, G], "
+            f"got {tuple(effective_scales_mg.shape)}"
+        )
+
+    m, num_groups = effective_scales_mg.shape
+    scale_elem_size = torch.tensor([], dtype=torch.float32).element_size()
+    values_per_aligned_row = max(1, alignment_bytes // scale_elem_size)
+    padded_num_groups = _align_up(num_groups, values_per_aligned_row)
+    packed = torch.zeros((1, m, 1, padded_num_groups), dtype=torch.float32)
+    packed[0, :, 0, :num_groups] = effective_scales_mg.to(torch.float32)
+    return packed.contiguous()
+
+
+def pack_w4a8_effective_scales_for_qnn_int32(
+    effective_scales_mg: torch.Tensor,
+    alignment_bytes: int = TMAN_A8_QNN_STATIC_ALIGNMENT_BYTES,
+) -> torch.Tensor:
+    # 和 qweight 一样，这里也让 QNN/HTP 看到一个 int32 容器，
+    # 但 runtime 侧仍把 raw bytes 按 float32* 解释。
+    #
+    # 这么做不是为了改变数学语义，而是为了尽量贴近旧 W4A16 的 static tensor
+    # transport 习惯：custom op 的大块静态数据都通过 int32 容器承载，
+    # 避免在 HTP prepare / copy 阶段再去赌 float static tensor 的实现细节。
+    packed_f32 = pack_w4a8_effective_scales_for_qnn(
+        effective_scales_mg,
+        alignment_bytes=alignment_bytes,
+    )
+    return packed_f32.view(torch.int32)
 
 
 def build_w4a8_weight_lut_indices(

@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文档用于把当前项目现状、`W4A16` TMAN linear 的真实执行链路、以及下一步 `W4A8` 改造的目标、边界、风险和验收标准一次性说明白，作为后续编码工作的统一参考。
+本文档用于把当前项目现状、`W4A16` TMAN linear 的真实执行链路、`W4A8` 改造的目标与边界，以及后续设备侧验证时需要关注的风险点一次性说明白，作为后续编码和交接工作的统一参考。
 
 这份文档重点避免后续把下面几件事混在一起：
 
@@ -23,11 +23,24 @@
   `Convert -> TMANPrecompute -> TMANLinear -> TMANFinalize -> Convert`；
 - Hexagon HVX 内核完成 LUT 构造、查表累加、位串行恢复和最终输出。
 
-当前 TMAN 路径本质上是一条 `W4A16` 路径：
+旧的稳定基线仍然是一条 `W4A16` 路径：
 
 - 权重：GPTQ int4
 - 激活：TMAN kernel 内部按 FP16/A16 路径处理
 - 输出：回到 FP16
+
+与此同时，当前代码中已经新增了一条专用的 `W4A8` baseline 支线，包含：
+
+- `TMANLinearA8`
+- `tman::linear_a8`
+- `op_tman_linear_a8.py`
+- `TMANPrecomputeA8 / TMANLinearA8 / TMANFinalizeA8`
+
+也就是说，当前代码状态已经不是“只有设计、没有实现”，而是：
+
+- `W4A16` 旧路径继续可作为稳定参考；
+- `W4A8` 新路径已经打通了 Python/export/lowering/runtime baseline；
+- 当前主要风险已从“功能缺失”转移到“设备侧 ABI / alignment / transport 可运行性”。
 
 ### 2.2 本次需求的真实目标
 
@@ -42,15 +55,19 @@
 
 ### 2.3 最重要的工程判断
 
-当前代码并没有一条现成的 `W4A8` 通路，原因很明确：
+当前最重要的工程判断不再是“有没有 `W4A8` 通路”，而是：
 
-- `TMANLinear` 模块本身不携带激活 scale；
-- `op_tman_linear.py` 里始终会在 TMAN 前后插 `Convert`，内部仍按 FP16 处理；
-- `TMANPrecompute.cpp` / `TMANLinear.cpp` / `TMANFinalize.cpp` 都是围绕现有 FP16 激活流写的；
-- `backends/qualcomm/quantizer/custom_annotation.py` 中明确写了 `tman::linear currently does not support 8a`；
-- 外部 `activation_scales_a8_per-tensor_sym.pt` 还没有接进模块构建、导出、lowering、运行时。
+- 当前代码已经有一条专用 `W4A8` 通路；
+- 这条通路已经通过轻量 Python/reference 验证；
+- 但合作者提供的 `logs/w4a8/` 设备日志显示，`W4A8` 运行阶段仍然存在段错误；
+- 从日志现象和代码结构看，当前最可疑的问题已集中在：
+  - custom op static tensor ABI
+  - HTP/HVX 对齐假设
+  - graph prepare / runtime transport 阶段对 static tensor 的搬运方式
 
-所以，`W4A8` 必须被视为一条新的 TMAN 专用路径，而不是改几个参数就能打通的小修小补。
+因此，后续工作不应再把 `W4A8` 视为“尚未实现”的功能缺口，而应视为：
+
+- 一条已经落地但仍需继续收紧 ABI / alignment 并交给设备环境反复验证的专用支线。
 
 ## 3. 已确认的项目事实
 
@@ -876,7 +893,7 @@ linear 激活量化必须满足：
 - GPTQ `W4G128`
 - `sym = true`
 
-### 15.2.2 当前对外 ABI 已压回 4D packed 形态
+### 15.2.2 当前对外 ABI 已压回 4D packed 形态，并继续向 `W4A16` transport 风格收紧
 
 逻辑语义上，当前 A8 helper 仍然按 block / vector-line 方式理解：
 
@@ -885,10 +902,20 @@ linear 激活量化必须满足：
 - LUT scratch logical:
   - `[row, group, qgroup_in_group, 16]`
 
-但为了降低 QNN / OpPackage 真编译阶段的 rank/schema 风险，当前 builder/runtime 对外 ABI 已重新压回 4D packed tensor：
+但为了降低 QNN / OpPackage 真编译阶段的 rank/schema 风险，当前 builder/runtime 对外 ABI 已重新压回 4D packed tensor，并在最近一轮修改中进一步把 static tensor 的物理承载方式向旧 `W4A16` 路径靠拢：
 
 - qweight ABI:
-  - `[1, M, G, qgroup_vector_blocks * (4 * bits)]`
+  - 逻辑字节布局仍等价于：
+    `[1, M, G, qgroup_vector_blocks * (4 * bits bytes)]`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, G, 32]` 的 `int32`
+  - runtime 侧仍按 `uint8*` 解释 raw bytes，因此数学语义不变
+- effective scales ABI:
+  - 逻辑语义仍是 group-wise `float32 effective_scale`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, 1, padded_num_groups]` 的 `int32`
+  - raw bytes 仍按 `float32*` 解释
+  - 每个 output row 已 pad 到 `128B` 对齐
 - LUT scratch ABI:
   - `[1, row, group, qgroup_vector_blocks * (4 * 16)]`
 
@@ -896,6 +923,27 @@ linear 激活量化必须满足：
 
 - helper kernel 内部继续按 block/vector-line 逻辑消费数据；
 - QNN 接口层继续维持更稳妥的 4D physical tensor 形态。
+
+### 15.2.3 当前 A8 路径已显式加入对齐保护
+
+当前 `hvx_funcs.h` 中又补了一轮面向设备侧稳定性的保护逻辑：
+
+- `tman_a8_is_vector_aligned(...)`
+- LUT block 的 HVX load/store 只有在满足 vector-line 对齐时才走直访存
+- `FinalizeA8` 的 HVX pack 路径只有在输入和输出 block 都满足对齐时才启用
+- 否则自动回退到 `memcpy` / scalar fallback
+
+这说明当前 A8 helper 已不再默认假设：
+
+- 所有 scratch / output 指针都天然满足 HVX 直访存对齐条件
+
+而是开始显式把：
+
+- 数学语义
+- transport 容器
+- HVX 对齐条件
+
+三者拆开处理。
 
 ## 15.3 当前真实验证结论
 
@@ -924,7 +972,7 @@ linear 激活量化必须满足：
 
 验证结论如下：
 
-- `test_tman_w4a8.py` 当前已通过 `15` 个轻量测试
+- `test_tman_w4a8.py` 当前已通过 `18` 个轻量测试
 - scale 文件对目标 `196` 个 decoder 内部 linear 覆盖完整
 - `runtime baseline` 与 `grouped reference` 完全一致
 - 与 `high-level dequant+matmul reference` 相比，极少数模块会出现 `1 个 INT8 bin` 的差异
@@ -942,7 +990,26 @@ linear 激活量化必须满足：
 
 的阶段，而不再只是“轻量 reference baseline”。
 
-## 15.4 当前已知边界
+## 15.4 当前设备侧证据边界
+
+目前需要特别强调的一点是：
+
+- 当前能直接代表 `W4A8` 设备现场问题的，只是 `logs/w4a8/` 下由合作者提供的运行日志；
+- `logs/w4a16/` 下的日志、以及旧 `W4A16` 路径生成的 `.pte` / `quant_attrs` / 历史产物，都只能作为参考对照；
+- 它们可以帮助判断：
+  - 旧路径的 transport/ABI 风格
+  - 旧路径的稳定运行方式
+- 但不能直接作为：
+  - 当前 `W4A8` graph 已如何落图
+  - 当前 `W4A8` 运行时已如何 transport
+  - 当前 `W4A8` 崩溃是否已经被修复
+
+因此，对当前代码更准确的判断是：
+
+- 适合交给合作者继续做新一轮 compile-only / rebuild / rerun；
+- 但还不能仅凭旧路径产物或旧日志宣称 `W4A8` 段错误已经解决。
+
+## 15.5 当前已知边界
 
 在使用：
 

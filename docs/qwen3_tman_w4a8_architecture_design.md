@@ -918,14 +918,36 @@ class TMANLinearA8(nn.Module):
 当前对外 ABI 形态为：
 
 - qweight:
-  - `[1, M, G, qgroup_vector_blocks * (4 * bits)]`
+  - 逻辑字节布局仍等价于：
+    `[1, M, G, qgroup_vector_blocks * (4 * bits bytes)]`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, G, 32]` 的 `int32`
 - LUT scratch:
   - `[1, row, group, qgroup_vector_blocks * (4 * 16)]`
+
+### 3. effective scales static tensor
+
+当前 A8 runtime 不再把 `effective_scales` 直接暴露成：
+
+- `[1, M, G, 1]` 的 `float32`
+
+而是进一步收敛为更接近旧 `W4A16` transport 风格的物理 ABI：
+
+- 逻辑语义：
+  - group-wise `float32 effective_scale`
+- transport/schema 容器：
+  - `[1, M, 1, padded_num_groups]` 的 `int32`
+- runtime 解释方式：
+  - raw bytes 仍按 `float32*` 解释
+- 对齐约束：
+  - 每个 output row pad 到 `128B`
+  - `TmanA8Layout` 通过 `scale_row_stride` 显式描述物理 stride
 
 这意味着：
 
 - helper kernel 内部继续按 block / vector-line 逻辑处理；
-- QNN schema / graph compile 阶段继续看到 4D packed tensor。
+- QNN schema / graph compile 阶段继续看到 4D packed tensor；
+- static qweight / effective_scales 的 transport 容器进一步向旧 `W4A16` 路径的 `int32` 风格收敛。
 
 ## 13.3 当前 helper kernel 组织方式
 
@@ -988,6 +1010,21 @@ class TMANLinearA8(nn.Module):
 
 因此，当前 A8 helper 已经不是“纯 scalar baseline”，而是“部分 intrinsic 化的 target-specific helper”。
 
+### 3. 对齐保护收敛
+
+当前 helper kernel 又新增了一轮“HVX 直访存对齐保护”：
+
+- `tman_a8_is_vector_aligned(...)`
+- LUT block 的 HVX load/store 只有在满足 vector-line 对齐时才直接使用 `HVX_Vector`
+- `FinalizeA8` 的 HVX pack 路径只有在输入 `c_row` 和输出 block 都满足对齐时才启用
+- 否则回退到 `memcpy` / scalar fallback
+
+这意味着当前 A8 路径在设备侧已经不再隐式假设：
+
+- 所有 scratch / output buffer 都天然满足 HVX 128B 对齐
+
+而是显式把“对齐满足时走快路径、不满足时走保守路径”的策略写进 helper 层。
+
 ## 13.4 当前正确性分层结论
 
 当前项目已经形成三套语义层次清晰的 reference：
@@ -1034,11 +1071,25 @@ class TMANLinearA8(nn.Module):
 当前轻量验证结论也应同步更新为：
 
 - `backends/qualcomm/tests/test_tman_w4a8.py`
-  - 当前已通过 `15` 个轻量测试
+  - 当前已通过 `18` 个轻量测试
 - `tools/tman_w4a8_reference_check.py`
   - 当前通过
 
-## 13.6 当前阶段的架构判断
+## 13.6 当前证据边界与交付含义
+
+当前需要特别说明：
+
+- 当前能够直接代表 `W4A8` 设备现场问题的，只是 `logs/w4a8/` 下由合作者提供的运行日志；
+- `logs/w4a16/` 下的日志以及旧 `.pte` / `quant_attrs` 只能用于参考旧路径的稳定 transport 风格；
+- 它们不能直接证明当前 `W4A8` graph 已按某种 ABI 落图，也不能直接证明最新 A8 修改已经生效。
+
+因此，当前架构层面的更准确判断是：
+
+- A8 的模块边界、logical layout、对外 ABI 和 helper kernel 组织已经足够清晰；
+- 当前代码已适合交给合作者重新生成 `W4A8 .pte`、重编 `TMANOpPackage` 并做下一轮设备测试；
+- 但是否真正修复了 device-side 段错误，还必须以新一轮 `W4A8` compile / run 日志为准。
+
+## 13.7 当前阶段的架构判断
 
 当前项目已经从：
 
@@ -1058,7 +1109,7 @@ class TMANLinearA8(nn.Module):
 
 为主线推进。
 
-## 13.7 当前推荐的后续演进顺序
+## 13.8 当前推荐的后续演进顺序
 
 结合当前已落地状态，后续最合理的实现顺序为：
 

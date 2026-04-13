@@ -13,7 +13,8 @@ import torch
 from executorch.backends.qualcomm.utils.tman_w4a8 import (
     build_w4a8_lut_scratch_packed_shape,
     infer_gptq_tensor_layout,
-    pack_w4a8_weight_lut_indices_for_qnn,
+    pack_w4a8_effective_scales_for_qnn_int32,
+    pack_w4a8_weight_lut_indices_for_qnn_int32,
     prepare_w4a8_baseline_runtime_tensors,
     TMAN_A8_TARGET_QGROUPS_PER_GROUP,
     TMAN_A8_TARGET_QGROUP_VECTOR_BLOCKS,
@@ -161,27 +162,29 @@ class TMANLinearA8(NodeVisitor):
             )
 
         num_rows = _get_num_rows(input_tensor.size())
-        qweight_static = pack_w4a8_weight_lut_indices_for_qnn(
+        qweight_static = pack_w4a8_weight_lut_indices_for_qnn_int32(
             qweight_lut_indices_mgqb,
             bits,
         )
-        # 这里检查的不是“任意 packed 4D 都可以”，
-        # 而是当前目标专用路径约定的最后一维必须正好等于：
-        #   qgroup_vector_blocks * (4 * bits)
-        # 对 `W4G128 sym` 而言，就是 8 * 16 = 128。
+        # W4A8 的 qweight 逻辑上仍是：
+        #   [1, M, G, qgroup_vector_blocks * (4 * bits bytes)]
+        # 这里只是为了和旧 W4A16 静态权重的 transport 习惯更接近，
+        # 把同一串原始字节 reinterpret 成 int32 容器。
+        #
+        # 因此这里检查的是“每个 [M,G] 行的真实字节数”仍然保持 128B。
         if (
-            qweight_static.shape[3]
+            qweight_static.shape[3] * qweight_static.element_size()
             != TMAN_A8_TARGET_QGROUP_VECTOR_BLOCKS * bits * 4
         ):
             raise RuntimeError(
                 "TMANLinearA8 lowering requires "
-                "packed qweight last dim="
+                "packed qweight bytes-per-[M,G]="
                 f"{TMAN_A8_TARGET_QGROUP_VECTOR_BLOCKS * bits * 4}, "
-                f"got {qweight_static.shape[3]}"
+                f"got {qweight_static.shape[3] * qweight_static.element_size()}"
             )
-        scales_static = effective_scales_mg.reshape(
-            1, effective_scales_mg.shape[0], effective_scales_mg.shape[1], 1
-        ).contiguous()
+        scales_static = pack_w4a8_effective_scales_for_qnn_int32(
+            effective_scales_mg
+        )
 
         qweight_tensor_wrapper = self.define_tensor(
             qweight_node,
@@ -273,7 +276,9 @@ class TMANLinearA8(NodeVisitor):
         # 但周围非 linear 图仍然保持当前 FP16 语义不变。
         #
         # 当前 static/scratch 的物理组织进一步显式成 block 形态：
-        # - qweight: [1, M, G, qgroup_vector_blocks * (4 * bits)]
+        # - qweight: [1, M, G, 32 int32]  (raw bytes 仍是 128B / [M,G])
+        # - scales : [1, M, 1, padded_num_groups] 的 int32 容器，
+        #            raw bytes 仍按 float32 effective scales 解释，且每行按 128B 对齐
         # - lut    : [1, R, G, qgroup_vector_blocks * (4 * 16)]
         #
         # 逻辑上仍然是 block 结构，只是对外 ABI 压回 4D packed tensor，

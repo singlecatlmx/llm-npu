@@ -207,7 +207,16 @@
 - LUT scratch：
   - `[1, row, group, qgroup_vector_blocks * (4 * 16)]`
 - qweight static：
-  - `[1, M, G, qgroup_vector_blocks * (4 * bits)]`
+  - 逻辑字节布局仍等价于：
+    `[1, M, G, qgroup_vector_blocks * (4 * bits bytes)]`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, G, 32]` 的 `int32`
+- effective scales static：
+  - 逻辑语义仍是 group-wise `float32 effective_scale`
+  - 当前 transport/schema 容器形态为：
+    `[1, M, 1, padded_num_groups]` 的 `int32`
+  - raw bytes 仍按 `float32*` 解释
+  - 每个 output row pad 到 `128B`
 
 也就是说：
 
@@ -262,7 +271,18 @@
 - GPTQ `W4G128`
 - `sym = true`
 
-的目标专用路径，而不是继续保留不必要的“泛配置”外观。
+## 6.5 当前设备侧证据边界
+
+当前需要特别注意：
+
+- 目前能直接代表 `W4A8` 现场问题的，只是 `logs/w4a8/` 下由合作者提供的运行日志；
+- `logs/w4a16/` 下的历史日志、以及旧路径生成的 `.pte` / `quant_attrs`，只能作为旧 `W4A16` transport/ABI 风格的参考；
+- 它们不能直接证明当前最新 `W4A8` graph 已如何落图，也不能直接证明当前最新 A8 修改已经在设备上生效。
+
+因此，当前对代码状态更准确的理解是：
+
+- 已适合交给合作者重新生成 `W4A8 .pte`、重编 `TMANOpPackage` 并做下一轮 rerun；
+- 但还不能宣称 `W4A8` 的设备侧段错误已经被修复。
 
 ## 7. 当前验证结论
 
@@ -275,6 +295,10 @@
 - `python tools/tman_w4a8_qwen3_scale_audit.py ...`
 - `python tools/tman_w4a8_real_layer_probe.py ...`
 - `python tools/tman_w4a8_model_slice_audit.py ...`
+
+其中：
+
+- `test_tman_w4a8.py` 当前已通过 `18` 个轻量测试
 
 ## 7.2 全量 196 个目标 linear 切片审计结论
 
@@ -413,7 +437,10 @@ python tools/tman_w4a8_model_slice_audit.py \
   - `W4`
   - `group_size = 128`
   - `symmetric = true`
-- 当前对外 ABI 已采用更稳妥的 4D packed 形态，降低了 QNN 编译阶段的 rank/schema 风险
+- 当前对外 ABI 已进一步向旧 `W4A16` transport 风格收紧：
+  - qweight / effective_scales 都通过 `int32` 容器承载
+  - effective scales 每行 pad 到 `128B`
+  - helper 已加入 HVX 对齐保护
 - 轻量 Python/reference 验证已经稳定通过
 
 但这仍然是“阶段性交付”，不是“最终可发布交付”，当前仍需外部环境完成下面几项：

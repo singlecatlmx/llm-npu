@@ -81,6 +81,37 @@ class TestTMANW4A8Utils(unittest.TestCase):
         self.assertEqual(tuple(packed.shape), (1, 1, 1, 128))
         self.assertEqual(packed.reshape(-1).tolist(), list(range(128)))
 
+    def test_pack_w4a8_weight_lut_indices_for_qnn_int32_preserves_raw_bytes(self):
+        grouped = torch.arange(128, dtype=torch.uint8).reshape(1, 1, 32, 4)
+        packed = TMAN_W4A8_MOD.pack_w4a8_weight_lut_indices_for_qnn_int32(grouped, 4)
+        self.assertEqual(tuple(packed.shape), (1, 1, 1, 32))
+        self.assertEqual(packed.dtype, torch.int32)
+        self.assertEqual(
+            packed.view(torch.uint8).reshape(-1).tolist(),
+            list(range(128)),
+        )
+
+    def test_pack_w4a8_effective_scales_for_qnn_pads_rows_to_128_bytes(self):
+        effective_scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+        packed = TMAN_W4A8_MOD.pack_w4a8_effective_scales_for_qnn(effective_scales)
+        self.assertEqual(tuple(packed.shape), (1, 2, 1, 32))
+        self.assertTrue(torch.allclose(packed[0, :, 0, :16], effective_scales))
+        self.assertTrue(torch.allclose(packed[0, :, 0, 16:], torch.zeros((2, 16))))
+
+    def test_pack_w4a8_effective_scales_for_qnn_int32_preserves_raw_f32_bits(self):
+        effective_scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+        packed = TMAN_W4A8_MOD.pack_w4a8_effective_scales_for_qnn_int32(
+            effective_scales
+        )
+        self.assertEqual(tuple(packed.shape), (1, 2, 1, 32))
+        self.assertEqual(packed.dtype, torch.int32)
+        self.assertTrue(
+            torch.allclose(
+                packed.view(torch.float32)[0, :, 0, :16],
+                effective_scales,
+            )
+        )
+
     def test_validate_w4a8_target_config_accepts_project_target(self):
         TMAN_W4A8_MOD.validate_w4a8_target_config(
             bits=4,

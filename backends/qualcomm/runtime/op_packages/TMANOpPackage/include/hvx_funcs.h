@@ -115,6 +115,7 @@ struct TmanA8Layout {
   int32_t num_groups;
   int32_t qgroups_per_group;
   int32_t qgroup_vector_blocks;
+  int32_t scale_row_stride;
 };
 
 inline TmanA8Layout tman_a8_make_layout(
@@ -124,7 +125,8 @@ inline TmanA8Layout tman_a8_make_layout(
   TmanA8Layout layout;
   layout.gemm_n = gemm_n;
   layout.gemm_m = gemm_m;
-  layout.gemm_k = layout.num_groups = layout.qgroups_per_group = layout.qgroup_vector_blocks = 0;
+  layout.gemm_k = layout.num_groups = layout.qgroups_per_group = layout.qgroup_vector_blocks =
+      layout.scale_row_stride = 0;
   if (group_size <= 0 || (group_size % TMAN_A8_LUT_GROUP) != 0) {
     return layout;
   }
@@ -154,6 +156,7 @@ inline bool tman_a8_populate_layout(
   }
   layout->gemm_k = gemm_k;
   layout->num_groups = gemm_k / group_size;
+  layout->scale_row_stride = layout->num_groups;
   return true;
 }
 
@@ -169,6 +172,10 @@ inline bool tman_a8_is_target_config(
 inline bool tman_a8_is_target_layout(const TmanA8Layout& layout) {
   return layout.qgroups_per_group == TMAN_A8_TARGET_QGROUPS_PER_GROUP &&
       layout.qgroup_vector_blocks == TMAN_A8_TARGET_QGROUP_VECTOR_BLOCKS;
+}
+
+inline bool tman_a8_is_vector_aligned(const void* ptr) {
+  return ((((uintptr_t)ptr) & (VLEN - 1)) == 0);
 }
 
 inline size_t tman_a8_lut_offset(
@@ -199,8 +206,7 @@ inline size_t tman_a8_scale_offset(
     const TmanA8Layout& layout,
     int32_t out_idx,
     int32_t group_idx) {
-  UNUSED(layout);
-  return ((size_t)out_idx * (size_t)layout.num_groups) + group_idx;
+  return ((size_t)out_idx * (size_t)layout.scale_row_stride) + group_idx;
 }
 
 inline size_t tman_a8_lut_block_offset(
@@ -284,10 +290,13 @@ inline void tman_a8_store_lut_block(
     int16_t* dst,
     const TmanA8LutBlock& block) {
 #ifdef __hexagon__
-  *reinterpret_cast<HVX_Vector*>(dst + 0) = *reinterpret_cast<const HVX_Vector*>(block.values + 0);
-#else
-  std::memcpy(dst, block.values, sizeof(TmanA8LutBlock));
+  if (tman_a8_is_vector_aligned(dst) && tman_a8_is_vector_aligned(block.values)) {
+    *reinterpret_cast<HVX_Vector*>(dst + 0) =
+        *reinterpret_cast<const HVX_Vector*>(block.values + 0);
+    return;
+  }
 #endif
+  std::memcpy(dst, block.values, sizeof(TmanA8LutBlock));
 }
 
 inline void tman_a8_load_lut_block_vectorized(
@@ -301,11 +310,13 @@ inline void tman_a8_load_lut_block_vectorized(
   // 这一步让 `LinearA8` 的目标专用 helper 已经开始具备“按向量寄存器 staging LUT block”
   // 的风格，而不再是纯标量逐元素读取。
 #ifdef __hexagon__
-  *reinterpret_cast<HVX_Vector*>(block->values) =
-      *reinterpret_cast<const HVX_Vector*>(src);
-#else
-  std::memcpy(block->values, src, sizeof(TmanA8LutBlock));
+  if (tman_a8_is_vector_aligned(src) && tman_a8_is_vector_aligned(block->values)) {
+    *reinterpret_cast<HVX_Vector*>(block->values) =
+        *reinterpret_cast<const HVX_Vector*>(src);
+    return;
+  }
 #endif
+  std::memcpy(block->values, src, sizeof(TmanA8LutBlock));
 }
 
 inline void tman_a8_zero_int_tile(TmanA8IntTile* tile) {
@@ -493,6 +504,9 @@ inline bool tman_a8_pack_output_block_hvx(
     TmanA8OutputBlock* block) {
 #ifdef __hexagon__
   if (cols_in_block != TMAN_A8_OUTPUT_VALUES_PER_VECTOR || block == nullptr) {
+    return false;
+  }
+  if (!tman_a8_is_vector_aligned(c_row) || !tman_a8_is_vector_aligned(block->values)) {
     return false;
   }
 
