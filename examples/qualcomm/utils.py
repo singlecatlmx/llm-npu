@@ -13,12 +13,17 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-
 import torch
+from torch.ao.quantization.observer import MovingAverageMinMaxObserver
+from torch.ao.quantization.quantize_pt2e import (
+    convert_pt2e,
+    prepare_pt2e,
+    prepare_qat_pt2e,
+)
+
 from executorch.backends.qualcomm.quantizer.quantizer import (
     ModuleQConfig,
     QnnQuantizer,
@@ -33,12 +38,6 @@ from executorch.backends.qualcomm.utils.utils import (
 )
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
-from torch.ao.quantization.observer import MovingAverageMinMaxObserver
-from torch.ao.quantization.quantize_pt2e import (
-    convert_pt2e,
-    prepare_pt2e,
-    prepare_qat_pt2e,
-)
 
 
 class SimpleADB:
@@ -158,6 +157,24 @@ class SimpleADB:
             f"{self.build_path}/backends/qualcomm/libqnn_executorch_backend.so",
             f"{self.qnn_sdk}/lib/aarch64-android/libQnnModelDlc.so",
         ]
+
+        # TMAN custom op package (if present). Prefer build artifacts that match
+        # current workspace/run, instead of relying on a stale absolute path on
+        # device.
+        tman_pkg_candidates = [
+            f"{self.build_path}/backends/qualcomm/runtime/op_packages/TMANOpPackage/libQnnTMANOpPackage.so",
+            f"{self.build_path}/backends/qualcomm/runtime/op_packages/TMANOpPackage/build/hexagon-v{self.htp_arch}/libQnnTMANOpPackage.so",
+            f"{self.build_path}/backends/qualcomm/runtime/op_packages/TMANOpPackage/build/htp_v{self.htp_arch}/libQnnTMANOpPackage.so",
+            f"{Path(__file__).resolve().parents[2]}/backends/qualcomm/runtime/op_packages/TMANOpPackage/build/hexagon-v{self.htp_arch}/libQnnTMANOpPackage.so",
+            f"{Path(__file__).resolve().parents[2]}/backends/qualcomm/runtime/op_packages/TMANOpPackage/build/htp_v{self.htp_arch}/libQnnTMANOpPackage.so",
+        ]
+        tman_pkg_path = None
+        for tman_pkg in tman_pkg_candidates:
+            if os.path.exists(tman_pkg):
+                artifacts.append(tman_pkg)
+                tman_pkg_path = tman_pkg
+                break
+
         input_list_file, input_files = generate_inputs(
             self.working_dir, self.input_list_filename, inputs, input_list
         )
@@ -168,6 +185,12 @@ class SimpleADB:
 
         for artifact in artifacts:
             self._adb(["push", artifact, self.workspace])
+
+        # Keep compatibility with runtime hardcoded op package path:
+        # /data/local/tmp/llama/libQnnTMANOpPackage.so
+        if tman_pkg_path is not None:
+            self._adb(["shell", "mkdir -p /data/local/tmp/llama"])
+            self._adb(["push", tman_pkg_path, "/data/local/tmp/llama/libQnnTMANOpPackage.so"])
 
         # input data
         for file_name in input_files:

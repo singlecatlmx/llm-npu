@@ -2,65 +2,158 @@
 #include "HTP/core/op_package_feature_support.h"
 #include "HTP/core/op_register_ext.h"
 #include "HTP/core/optimize.h"
-#include "QnnOpPackage.h"
 #include "HTP/core/simple_reg.h"
+#include "QnnOpPackage.h"
 
 #include "hvx_funcs.h"
 
 BEGIN_PKG_OP_DEFINITION(PKG_TMANLinearA8);
 
-static Qnn_Scalar_t sg_opDefaultGroup_SizeScalar = {.dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
-                                                   .int32Value = 128};
-static Qnn_Param_t sg_opDefaultGroup_Size = {.paramType = QNN_PARAMTYPE_SCALAR,
-                                            .scalarParam = sg_opDefaultGroup_SizeScalar};
-static Qnn_Scalar_t sg_opDefaultBitsScalar = {.dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
-                                             .int32Value = 4};
-static Qnn_Param_t sg_opDefaultBits = {.paramType = QNN_PARAMTYPE_SCALAR,
-                                      .scalarParam = sg_opDefaultBitsScalar};
-static Qnn_Scalar_t sg_opDefaultSymmetricScalar = {.dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
-                                                  .int32Value = 1};
-static Qnn_Param_t sg_opDefaultSymmetric = {.paramType = QNN_PARAMTYPE_SCALAR,
-                                           .scalarParam = sg_opDefaultSymmetricScalar};
+static Qnn_Scalar_t sg_opDefaultGroup_SizeScalar = {
+    .dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
+    .int32Value = 128};
+static Qnn_Param_t sg_opDefaultGroup_Size = {
+    .paramType = QNN_PARAMTYPE_SCALAR,
+    .scalarParam = sg_opDefaultGroup_SizeScalar};
+static Qnn_Scalar_t sg_opDefaultBitsScalar = {
+    .dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
+    .int32Value = 4};
+static Qnn_Param_t sg_opDefaultBits = {
+    .paramType = QNN_PARAMTYPE_SCALAR,
+    .scalarParam = sg_opDefaultBitsScalar};
+static Qnn_Scalar_t sg_opDefaultSymmetricScalar = {
+    .dataType = Qnn_DataType_t::QNN_DATATYPE_INT_32,
+    .int32Value = 1};
+static Qnn_Param_t sg_opDefaultSymmetric = {
+    .paramType = QNN_PARAMTYPE_SCALAR,
+    .scalarParam = sg_opDefaultSymmetricScalar};
 
-template<typename TensorType>
-GraphStatus tmanlineara8Impl(TensorType& c,
-                             const TensorType& l,
-                             const TensorType& qweight,
-                             const TensorType& scales,
-                             const Int32Tensor& t_group_size,
-                             const Int32Tensor& t_bits,
-                             const Int32Tensor& t_symmetric);
+template <typename TensorType>
+GraphStatus tmanlineara8Impl(
+    TensorType& c,
+    const TensorType& l,
+    const TensorType& qweight,
+    const TensorType& scales,
+    const Int32Tensor& t_group_size,
+    const Int32Tensor& t_bits,
+    const Int32Tensor& t_symmetric);
 
-static float tmanlineara8CostFunc(const Op *op);
+static float tmanlineara8CostFunc(const Op* op);
 
 DEF_PACKAGE_OP((tmanlineara8Impl<Tensor>), "TMANLinearA8")
 
 DEF_TENSOR_PROPERTIES(
-  Op("TMANLinearA8", "l", "qweight", "scales", "group_size", "bits", "symmetric"),
-  Flat("*", "l", "qweight", "scales"),
-  MainMemory("group_size", "bits", "symmetric"),
-  Tcm("*", "l", "qweight", "scales"))
+    Op("TMANLinearA8",
+       "l",
+       "qweight",
+       "scales",
+       "group_size",
+       "bits",
+       "symmetric"),
+    Flat("*", "l", "qweight", "scales"),
+    MainMemory("group_size", "bits", "symmetric"),
+    Tcm("*", "l", "qweight", "scales"))
 
-DEF_PACKAGE_PARAM_ORDER("TMANLinearA8",
-                        "group_size",
-                        false,
-                        &sg_opDefaultGroup_Size,
-                        "bits",
-                        false,
-                        &sg_opDefaultBits,
-                        "symmetric",
-                        false,
-                        &sg_opDefaultSymmetric)
+#define SIZE_OF(WEIGHT)       \
+  MUL(ELEMENTSIZE_OF(WEIGHT), \
+      DIM_OF(WEIGHT, 0),      \
+      DIM_OF(WEIGHT, 1),      \
+      DIM_OF(WEIGHT, 2),      \
+      DIM_OF(WEIGHT, 3))
 
-template<typename TensorType>
-GraphStatus tmanlineara8Impl(TensorType& c,
-                             const TensorType& l,
-                             const TensorType& qweight,
-                             const TensorType& scales,
-                             const Int32Tensor& t_group_size,
-                             const Int32Tensor& t_bits,
-                             const Int32Tensor& t_symmetric)
-{
+// A8 路径的量化语义与 W4A16 一样，都会随着层数/宽度变大而快速膨胀。
+// 这里补上和 TMANLinear 一致的自动切分规则，避免 QNN 在 TCM 迁移阶段
+// 试图把整层 TMANLinearA8 当成一个不可切分的大算子处理。
+DEF_PACKAGE_OPTIMIZATION(
+    EARLY,
+    Op("TMANLinearA8",
+       "l",
+       "qweight",
+       "scales",
+       "group_size",
+       "bits",
+       "symmetric"),
+    AND(GT(DIM_OF("qweight", 2), 1), GT(SIZE_OF("scales"), 128)),
+    AUTOSPLIT(
+        3,
+        "I",
+        DIV(DIM_OF("*", 3), DIM_OF("qweight", 2)),
+        Op("TMANLinearA8",
+           "l",
+           AUTOSPLIT_SLICE(
+               "qweight",
+               AUTOSPLIT_SHAPEFN_APPLY(
+                   simpledim_split_start,
+                   "I",
+                   "qweight",
+                   2),
+               AUTOSPLIT_SHAPEFN_APPLY(
+                   simpledim_split_size,
+                   "I",
+                   "qweight",
+                   2)),
+           AUTOSPLIT_SLICE(
+               "scales",
+               AUTOSPLIT_SHAPEFN_APPLY(simpledim_split_start, "I", "scales", 3),
+               AUTOSPLIT_SHAPEFN_APPLY(simpledim_split_size, "I", "scales", 3)),
+           "group_size",
+           "bits",
+           "symmetric")))
+
+DEF_PACKAGE_OPTIMIZATION(
+    EARLY + 1,
+    Op("TMANLinearA8",
+       "l",
+       "qweight",
+       "scales",
+       "group_size",
+       "bits",
+       "symmetric"),
+    AND(GT(DIM_OF("qweight", 2), 1), LE(SIZE_OF("scales"), 128)),
+    AUTOSPLIT(
+        3,
+        "I",
+        DIV(DIM_OF("*", 3), DIM_OF("qweight", 2)),
+        Op("TMANLinearA8",
+           "l",
+           AUTOSPLIT_SLICE(
+               "qweight",
+               AUTOSPLIT_SHAPEFN_APPLY(
+                   simpledim_split_start,
+                   "I",
+                   "qweight",
+                   2),
+               AUTOSPLIT_SHAPEFN_APPLY(
+                   simpledim_split_size,
+                   "I",
+                   "qweight",
+                   2)),
+           "scales",
+           "group_size",
+           "bits",
+           "symmetric")))
+
+DEF_PACKAGE_PARAM_ORDER(
+    "TMANLinearA8",
+    "group_size",
+    false,
+    &sg_opDefaultGroup_Size,
+    "bits",
+    false,
+    &sg_opDefaultBits,
+    "symmetric",
+    false,
+    &sg_opDefaultSymmetric)
+
+template <typename TensorType>
+GraphStatus tmanlineara8Impl(
+    TensorType& c,
+    const TensorType& l,
+    const TensorType& qweight,
+    const TensorType& scales,
+    const Int32Tensor& t_group_size,
+    const Int32Tensor& t_bits,
+    const Int32Tensor& t_symmetric) {
   // `TMANLinearA8` 是 A8 三段式里的核心算子，但这里依旧只做：
   // 1. 参数 / tensor rank / packed ABI 校验；
   // 2. 把 packed 4D 物理形态恢复成 helper 可理解的 layout；
@@ -69,9 +162,21 @@ GraphStatus tmanlineara8Impl(TensorType& c,
   // 这样做的原因是：
   // - 便于把复杂 kernel 逻辑集中在一个地方维护；
   // - 便于后续 device 编译问题先定位“接口层”还是“helper 内核层”。
-  const int32_t group_size = ((const int32_t*)t_group_size.raw_data_const())[0];
-  const int32_t bits = ((const int32_t*)t_bits.raw_data_const())[0];
-  const bool symmetric = ((const int32_t*)t_symmetric.raw_data_const())[0] != 0;
+  const int32_t* group_size_ptr = (const int32_t*)t_group_size.raw_data_const();
+  if (group_size_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  const int32_t* bits_ptr = (const int32_t*)t_bits.raw_data_const();
+  if (bits_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  const int32_t* symmetric_ptr = (const int32_t*)t_symmetric.raw_data_const();
+  if (symmetric_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  const int32_t group_size = group_size_ptr[0];
+  const int32_t bits = bits_ptr[0];
+  const bool symmetric = symmetric_ptr[0] != 0;
   if (!tman_a8_is_target_config(bits, group_size, symmetric)) {
     return GraphStatus::ErrorFatal;
   }
@@ -86,20 +191,21 @@ GraphStatus tmanlineara8Impl(TensorType& c,
   // 其中最后一维虽然以 int32 容器承载，但 raw bytes 仍然是：
   //   qgroup_vector_blocks * (4 * bits)
   // 这里先把最后一维换算回真实字节数，再恢复 qgroup_vector_blocks。
-  if (qweight_dims.size() != 4 ||
-      (int32_t)qweight_dims[0] != 1 ||
+  if (qweight_dims.size() != 4 || (int32_t)qweight_dims[0] != 1 ||
       (int32_t)qweight_dims[1] != gemm_m) {
     return GraphStatus::ErrorFatal;
   }
   const int32_t num_groups = (int32_t)qweight_dims[2];
   const int32_t packed_weight_int32 = (int32_t)qweight_dims[3];
-  const int32_t packed_weight_bytes = packed_weight_int32 * (int32_t)sizeof(int32_t);
+  const int32_t packed_weight_bytes =
+      packed_weight_int32 * (int32_t)sizeof(int32_t);
   if (packed_weight_bytes % TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK != 0) {
     return GraphStatus::ErrorFatal;
   }
   const int32_t qgroup_vector_blocks =
       packed_weight_bytes / TMAN_A8_WEIGHT_IDX_VALUES_PER_VECTOR_BLOCK;
-  const int32_t qgroups_per_group = qgroup_vector_blocks * TMAN_A8_QGROUPS_PER_VECTOR;
+  const int32_t qgroups_per_group =
+      qgroup_vector_blocks * TMAN_A8_QGROUPS_PER_VECTOR;
   const int32_t gemm_k = num_groups * qgroups_per_group * 4;
   if (gemm_k % 4 != 0 || group_size % 4 != 0) {
     return GraphStatus::ErrorFatal;
@@ -119,19 +225,15 @@ GraphStatus tmanlineara8Impl(TensorType& c,
   auto l_dims = l.dims();
   // LUT scratch 对外 ABI 也是 4D packed：
   // [1, row, group, qgroup_vector_blocks * (4 * 16)]
-  if (l_dims.size() != 4 ||
-      (int32_t)l_dims[0] != 1 ||
-      (int32_t)l_dims[1] != gemm_n ||
-      (int32_t)l_dims[2] != num_groups ||
+  if (l_dims.size() != 4 || (int32_t)l_dims[0] != 1 ||
+      (int32_t)l_dims[1] != gemm_n || (int32_t)l_dims[2] != num_groups ||
       (int32_t)l_dims[3] !=
           qgroup_vector_blocks * TMAN_A8_LUT_VALUES_PER_VECTOR_BLOCK) {
     return GraphStatus::ErrorFatal;
   }
   auto scales_dims = scales.dims();
-  if (scales_dims.size() != 4 ||
-      (int32_t)scales_dims[0] != 1 ||
-      (int32_t)scales_dims[1] != gemm_m ||
-      (int32_t)scales_dims[2] != 1 ||
+  if (scales_dims.size() != 4 || (int32_t)scales_dims[0] != 1 ||
+      (int32_t)scales_dims[1] != gemm_m || (int32_t)scales_dims[2] != 1 ||
       (int32_t)scales_dims[3] < num_groups ||
       (((int32_t)scales_dims[3] * (int32_t)sizeof(float)) % 128) != 0) {
     return GraphStatus::ErrorFatal;
@@ -139,23 +241,29 @@ GraphStatus tmanlineara8Impl(TensorType& c,
   layout.scale_row_stride = (int32_t)scales_dims[3];
 
   const int16_t* l_ptr = (const int16_t*)l.raw_data_const();
+  if (l_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
   const uint8_t* idx_ptr = (const uint8_t*)qweight.raw_data_const();
-  // `scales` 在 schema/transport 上按 int32 容器承载，但 raw bytes 仍然是 float32。
+  if (idx_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  // `scales` 在 schema/transport 上按 int32 容器承载，但 raw bytes 仍然是
+  // float32。
   const float* s_ptr = (const float*)scales.raw_data_const();
+  if (s_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
   float* c_ptr = (float*)c.raw_data();
-  tman_a8_linear_scalar(
-      layout,
-      bits,
-      l_ptr,
-      idx_ptr,
-      s_ptr,
-      c_ptr);
+  if (c_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  tman_a8_linear_scalar(layout, bits, l_ptr, idx_ptr, s_ptr, c_ptr);
 
   return GraphStatus::Success;
 }
 
-__attribute__((unused)) static float tmanlineara8CostFunc(const Op *op)
-{
+__attribute__((unused)) static float tmanlineara8CostFunc(const Op* op) {
   float cost = 0.0;
   return cost;
 }

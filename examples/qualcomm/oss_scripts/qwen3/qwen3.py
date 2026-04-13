@@ -19,6 +19,8 @@ from functools import partial
 from multiprocessing.connection import Client
 
 import torch
+from executorch.backends.qualcomm.utils.tman_w4a8 import ActivationScaleRegistry
+
 from executorch.backends.qualcomm._passes import FoldQDQ, TagQuantIO
 from executorch.backends.qualcomm._passes.i64_to_i32 import I64toI32
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
@@ -27,18 +29,14 @@ from executorch.backends.qualcomm._passes.qnn_pass_manager import (
 from executorch.backends.qualcomm._passes.utils import (
     get_passes_dependency_for_capture_program,
 )
-
 from executorch.backends.qualcomm.builders.utils import is_graph_output
-
 from executorch.backends.qualcomm.quantizer.custom_annotation import (
     annotate_linear_16a8w_in_affine_layer,
     annotate_matmul_16a8w,
     annotate_prefill_kv_output,
 )
-
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset
-
 from executorch.backends.qualcomm.serialization.qc_schema_serialize import (
     flatbuffer_to_option,
     option_to_flatbuffer,
@@ -51,9 +49,9 @@ from executorch.backends.qualcomm.utils.constants import (
 from executorch.backends.qualcomm.utils.utils import (
     convert_linear_to_conv2d,
     convert_linear_to_qlinear,
+    convert_qlinear_to_linear,
     convert_qlinear_to_tman_linear,
     convert_qlinear_to_tman_linear_a8,
-    convert_qlinear_to_linear,
     generate_composite_llama_program,
     generate_htp_compiler_spec,
     generate_multi_graph_program,
@@ -62,8 +60,6 @@ from executorch.backends.qualcomm.utils.utils import (
     to_edge_transform_and_lower_to_qnn,
     update_spill_fill_size,
 )
-from executorch.backends.qualcomm.utils.tman_w4a8 import ActivationScaleRegistry
-
 from executorch.devtools.backend_debug import print_delegation_info
 from executorch.examples.models.llama.source_transformation.quantize import (
     get_quant_embedding_transform,
@@ -76,29 +72,29 @@ sys.path.insert(0, current_dir)
 sys.path.insert(0, parent_dir)
 
 # 现在可以直接导入本地模块
+from gptqmodel import GPTQModel
 from model.static_qwen3 import (
-    Qwen3ForCausalLM,
     Qwen3Config,
     Qwen3DecoderLayer,
+    Qwen3ForCausalLM,
 )
+from pytorch_tokenizers import HuggingFaceTokenizer, TiktokenTokenizer, get_tokenizer
+from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
+from torch.ao.quantization.observer import MinMaxObserver
+from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
 from utils import (
+    SimpleADB,
     make_output_dir,
     make_quantizer,
     setup_common_args_and_variables,
-    SimpleADB,
 )
+
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.extension.llm.custom_ops import model_sharding
 from executorch.extension.llm.export.builder import DType
-from pytorch_tokenizers import get_tokenizer, TiktokenTokenizer, HuggingFaceTokenizer
-from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
 
-from torch.ao.quantization.observer import MinMaxObserver
-from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
-
-from gptqmodel import GPTQModel
 # from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear  # 注释掉直接导入
 
 sys.setrecursionlimit(4096)
@@ -487,7 +483,10 @@ class SingleLlama:
 
             for n in edge_prog_mgr.exported_program().graph.nodes:
                 if n.op == "output":
-                    for node, output_encoding in n.meta[QCOM_QUANT_ATTRS_MAP].items():
+                    quant_attrs_map = n.meta.get(QCOM_QUANT_ATTRS_MAP, None)
+                    if quant_attrs_map is None:
+                        continue
+                    for node, output_encoding in quant_attrs_map.items():
                         if node.meta["val"].size() in self.io_shape:
                             self.quant_attrs = output_encoding
 
@@ -860,7 +859,10 @@ def compile(args, pte_filename, tokenizer):
         ]
         for n in edge_prog_mgrs[0].exported_program().graph.nodes:
             if n.op == "output":
-                for node, output_encoding in n.meta[QCOM_QUANT_ATTRS_MAP].items():
+                quant_attrs_map = n.meta.get(QCOM_QUANT_ATTRS_MAP, None)
+                if quant_attrs_map is None:
+                    continue
+                for node, output_encoding in quant_attrs_map.items():
                     if node.meta["val"].size() in llama_instance_list[0].io_shape:
                         quant_attrs = output_encoding
 

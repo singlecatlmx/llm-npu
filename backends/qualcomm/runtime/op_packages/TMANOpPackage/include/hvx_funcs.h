@@ -18,6 +18,24 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+#ifndef _HVX_INTERNAL_H
+#define _HVX_INTERNAL_H
+
+#define VLEN 128
+#define vmem(A)     *((HVX_Vector *)(A))
+#define HVX_INLINE_ALWAYS inline __attribute__((unused,always_inline))
+static HVX_INLINE_ALWAYS void l2fetch(const void *p, uint32_t stride,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t dir)
+{
+#ifdef __hexagon__
+    uint64_t control = HEXAGON_V64_CREATE_H(dir, stride, width, height);
+    __asm__ __volatile__ (" l2fetch(%0,%1) " : :"r"(p),"r"(control));
+#endif
+}
+
+#endif /* _HVX_INTERNAL_H */
+
 static inline int32_t _fp32_to_bits(float x)
 {
   union {
@@ -728,24 +746,6 @@ inline void tman_a8_finalize_scalar(
     }
   }
 }
-
-#ifndef _HVX_INTERNAL_H
-#define _HVX_INTERNAL_H
-
-#define VLEN 128
-#define vmem(A)     *((HVX_Vector *)(A))
-#define HVX_INLINE_ALWAYS inline __attribute__((unused,always_inline))
-static HVX_INLINE_ALWAYS void l2fetch(const void *p, uint32_t stride,
-                                      uint32_t width, uint32_t height,
-                                      uint32_t dir)
-{
-#ifdef __hexagon__
-    uint64_t control = HEXAGON_V64_CREATE_H(dir, stride, width, height);
-    __asm__ __volatile__ (" l2fetch(%0,%1) " : :"r"(p),"r"(control));
-#endif
-}
-
-#endif /* _HVX_INTERNAL_H */
 
 template <typename LType,
           typename XType,
