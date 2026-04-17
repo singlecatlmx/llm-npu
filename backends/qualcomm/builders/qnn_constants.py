@@ -531,8 +531,32 @@ class OpTMANPrecompute:
 
 
 @dataclass(init=False, frozen=True)
+class OpTMANPrecomputeA8:
+    op_name: str = "TMANPrecomputeA8"
+    param_group_size: str = "group_size"
+    param_bits: str = "bits"
+    param_symmetric: str = "symmetric"
+
+
+@dataclass(init=False, frozen=True)
+class OpTMANLinearA8:
+    op_name: str = "TMANLinearA8"
+    param_group_size: str = "group_size"
+    param_bits: str = "bits"
+    param_symmetric: str = "symmetric"
+
+
+@dataclass(init=False, frozen=True)
 class OpTMANFinalize:
     op_name: str = "TMANFinalize"
+    param_group_size: str = "group_size"
+    param_bits: str = "bits"
+    param_symmetric: str = "symmetric"
+
+
+@dataclass(init=False, frozen=True)
+class OpTMANFinalizeA8:
+    op_name: str = "TMANFinalizeA8"
     param_group_size: str = "group_size"
     param_bits: str = "bits"
     param_symmetric: str = "symmetric"

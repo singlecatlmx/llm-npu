@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpDefCollection PackageName="TMANOpPackage" Domain="" Version="1.0">
+    <OpDefList>
+        <OpDef>
+            <Name>TMANPrecomputeA8</Name>
+            <Description>
+                <Content>Build packed [lut][ls][lb] scratch from fp16 activations for the W4A8 TMAN path</Content>
+            </Description>
+
+            <Input>
+                <Name>x</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>input_scale</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Output>
+                <Name>l</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Output>
+
+            <Parameter>
+                <Name>group_size</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>128</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>bits</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>4</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>symmetric</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>1</Default>
+            </Parameter>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+        <OpDef>
+            <Name>TMANLinearA8</Name>
+            <Description>
+                <Content>W4A8 TMAN linear op reusing the fp16 TMAN scratch layout and bit-serial finalize path</Content>
+            </Description>
+
+            <Input>
+                <Name>l</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>qweight</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Input>
+                <Name>scales</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Output>
+                <Name>c</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Output>
+
+            <Parameter>
+                <Name>group_size</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>128</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>bits</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>4</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>symmetric</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>1</Default>
+            </Parameter>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+        <OpDef>
+            <Name>TMANFinalizeA8</Name>
+            <Description>
+                <Content>Bit-serial finalize with output activation quantize-dequant to fp16</Content>
+            </Description>
+
+            <Input>
+                <Name>c</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>output_scale</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Output>
+                <Name>y</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Output>
+
+            <Parameter>
+                <Name>group_size</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>128</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>bits</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>4</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>symmetric</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>1</Default>
+            </Parameter>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+    </OpDefList>
+</OpDefCollection>

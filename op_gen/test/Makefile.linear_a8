@@ -1,0 +1,176 @@
+# TMANLinearA8 FP16 全链路测试
+#
+# 支持三种模式：
+# 1. x86 模拟器一体化运行
+# 2. x86 离线编译 context binary
+# 3. 骁龙 8 Gen 3 / HTP v75 设备端执行
+
+QNN_SDK_ROOT ?= /home/tang/QNN/qairt/2.40.0.251030
+ANDROID_NDK_ROOT ?= /home/tang/android-ndk-r28b
+
+QNN_INCLUDE := $(QNN_SDK_ROOT)/include/QNN
+QNN_LIB_X86 := $(QNN_SDK_ROOT)/lib/x86_64-linux-clang
+QNN_LIB_ANDROID := $(QNN_SDK_ROOT)/lib/aarch64-android
+QNN_LIB_HEX_V75 := $(QNN_SDK_ROOT)/lib/hexagon-v75/unsigned
+
+TMAN_HEXAGON_SDK_ROOT ?= /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.4.0.1
+TMAN_HEXAGON_TOOLS_VERSION_X86 ?= 19.0.04
+TMAN_HEXAGON_TOOLS_VERSION_V75 ?= 19.0.04
+
+OP_PKG_DIR ?= ../../backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8
+OP_PKG_MAKEFLAGS ?= -B
+OP_PACKAGE_NAME := TMANOpPackage
+OP_PKG_X86 := $(OP_PKG_DIR)/build/x86_64-linux-clang/libQnn$(OP_PACKAGE_NAME).so
+OP_PKG_HEX_V75 := $(OP_PKG_DIR)/build/hexagon-v75/libQnn$(OP_PACKAGE_NAME).so
+
+TARGET := test_tman_linear_a8
+SRC := test_tman_linear_a8.cpp
+BUILD_X86 := build_x86
+BUILD_ANDROID := build_android
+
+DEVICE_DIR := /data/local/tmp/tman_linear_a8_test
+CTX_BIN := tman_linear_a8_ctx.bin
+CTX_META := tman_linear_a8_ctx.meta
+
+NDK_TOOLCHAIN := $(ANDROID_NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64
+AARCH64_CXX := $(NDK_TOOLCHAIN)/bin/clang++ \
+	--target=aarch64-none-linux-android28 \
+	--sysroot=$(NDK_TOOLCHAIN)/sysroot
+
+X86_CXX ?= clang++
+COMMON_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -I$(QNN_INCLUDE)
+COMMON_CXXFLAGS += -I$(OP_PKG_DIR)/include
+X86_LDFLAGS := -ldl -Wl,-rpath,'$$ORIGIN'
+ANDROID_LDFLAGS := -ldl -llog
+
+.PHONY: all x86 android build_pkg_x86 build_pkg_v75 run_x86 compile_context \
+	push push_v75 exec_v75 run_android run_v75 clean help \
+	check-env-common check-env-x86 check-env-android
+
+all: x86 android
+	@echo ""
+	@echo "[OK] Built host and android harnesses."
+
+x86: check-env-common check-env-x86 $(BUILD_X86)/$(TARGET)
+	@echo "Built: $(BUILD_X86)/$(TARGET)"
+
+$(BUILD_X86)/$(TARGET): $(SRC) | $(BUILD_X86)
+	$(X86_CXX) $(COMMON_CXXFLAGS) -o $@ $< $(X86_LDFLAGS)
+
+$(BUILD_X86):
+	mkdir -p $(BUILD_X86)
+
+android: check-env-common check-env-android $(BUILD_ANDROID)/$(TARGET)
+	@echo "Built: $(BUILD_ANDROID)/$(TARGET)"
+
+$(BUILD_ANDROID)/$(TARGET): $(SRC) | $(BUILD_ANDROID)
+	$(AARCH64_CXX) $(COMMON_CXXFLAGS) -o $@ $< $(ANDROID_LDFLAGS)
+
+$(BUILD_ANDROID):
+	mkdir -p $(BUILD_ANDROID)
+
+build_pkg_x86: check-env-common
+	$(MAKE) $(OP_PKG_MAKEFLAGS) -C $(OP_PKG_DIR) \
+		htp_x86 \
+		PACKAGE_NAME=$(OP_PACKAGE_NAME) \
+		QNN_SDK_ROOT=$(QNN_SDK_ROOT) \
+		HEXAGON_SDK_ROOT=$(TMAN_HEXAGON_SDK_ROOT) \
+		HEXAGON_TOOLS_VERSION_X86=$(TMAN_HEXAGON_TOOLS_VERSION_X86)
+
+build_pkg_v75: check-env-common
+	$(MAKE) $(OP_PKG_MAKEFLAGS) -C $(OP_PKG_DIR) \
+		htp_v75 \
+		PACKAGE_NAME=$(OP_PACKAGE_NAME) \
+		QNN_SDK_ROOT=$(QNN_SDK_ROOT) \
+		HEXAGON_SDK_ROOT=$(TMAN_HEXAGON_SDK_ROOT) \
+		HEXAGON_TOOLS_VERSION_X86=$(TMAN_HEXAGON_TOOLS_VERSION_X86) \
+		HEXAGON_TOOLS_VERSION_V75=$(TMAN_HEXAGON_TOOLS_VERSION_V75)
+
+run_x86: build_pkg_x86 x86
+	LD_LIBRARY_PATH="$(QNN_LIB_X86):$$LD_LIBRARY_PATH" \
+		./$(BUILD_X86)/$(TARGET) \
+		$(QNN_LIB_X86)/libQnnHtp.so \
+		$(OP_PKG_X86)
+
+compile_context: build_pkg_x86 x86
+	@test -f "$(OP_PKG_X86)" || \
+		(echo "[ERROR] $(OP_PKG_X86) not found" && exit 1)
+	LD_LIBRARY_PATH="$(QNN_LIB_X86):$$LD_LIBRARY_PATH" \
+		./$(BUILD_X86)/$(TARGET) --compile \
+		$(QNN_LIB_X86)/libQnnHtp.so \
+		$(OP_PKG_X86) \
+		$(CTX_BIN)
+
+push: push_v75
+
+push_v75: build_pkg_v75 android compile_context
+	@echo "========================================"
+	@echo "  Pushing files to device: $(DEVICE_DIR)"
+	@echo "========================================"
+	@test -f "$(CTX_BIN)" || \
+		(echo "[ERROR] $(CTX_BIN) not found. Run: make -f Makefile.linear_a8 compile_context" && exit 1)
+	@test -f "$(CTX_META)" || \
+		(echo "[ERROR] $(CTX_META) not found. Run: make -f Makefile.linear_a8 compile_context" && exit 1)
+	@test -f "$(OP_PKG_HEX_V75)" || \
+		(echo "[ERROR] $(OP_PKG_HEX_V75) not found. Run: make -f Makefile.linear_a8 build_pkg_v75" && exit 1)
+	adb shell "mkdir -p $(DEVICE_DIR)/hexagon"
+	adb push $(BUILD_ANDROID)/$(TARGET) $(DEVICE_DIR)/
+	adb push $(CTX_BIN) $(DEVICE_DIR)/
+	adb push $(CTX_META) $(DEVICE_DIR)/
+	adb push $(QNN_LIB_ANDROID)/libQnnHtp.so $(DEVICE_DIR)/
+	adb push $(QNN_LIB_ANDROID)/libQnnHtpPrepare.so $(DEVICE_DIR)/
+	adb push $(QNN_LIB_ANDROID)/libQnnHtpV75Stub.so $(DEVICE_DIR)/ 2>/dev/null || true
+	@for f in $(QNN_LIB_HEX_V75)/libQnnHtpV75Skel.so \
+	          $(QNN_LIB_HEX_V75)/libqnnhtpv75.cat; do \
+		if [ -f "$$f" ]; then adb push "$$f" $(DEVICE_DIR)/; fi; \
+	done
+	adb push $(OP_PKG_HEX_V75) $(DEVICE_DIR)/hexagon/libQnnTMANOpPackage.so
+	adb shell "chmod +x $(DEVICE_DIR)/$(TARGET)"
+	@echo "[OK] Device files updated."
+
+exec_v75:
+	adb shell "cd $(DEVICE_DIR) && \
+	export LD_LIBRARY_PATH=$(DEVICE_DIR) && \
+	export ADSP_LIBRARY_PATH=\"$(DEVICE_DIR)/hexagon;$(DEVICE_DIR);/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp\" && \
+	./$(TARGET) --execute \
+		./libQnnHtp.so \
+		./hexagon/libQnnTMANOpPackage.so \
+		./$(CTX_BIN)"
+
+run_android: push_v75 exec_v75
+
+run_v75: push_v75 exec_v75
+
+clean:
+	rm -rf $(BUILD_X86) $(BUILD_ANDROID) $(CTX_BIN) $(CTX_META)
+	@echo "Cleaned A8 test artifacts"
+
+check-env-common:
+	@test -d "$(QNN_SDK_ROOT)" || \
+		(echo "[ERROR] QNN_SDK_ROOT not found: $(QNN_SDK_ROOT)" && exit 1)
+	@test -f "$(QNN_INCLUDE)/QnnInterface.h" || \
+		(echo "[ERROR] QNN headers not found at $(QNN_INCLUDE)" && exit 1)
+
+check-env-x86:
+	@command -v $(firstword $(X86_CXX)) >/dev/null 2>&1 || \
+		(echo "[ERROR] clang++ not found" && exit 1)
+
+check-env-android:
+	@test -d "$(ANDROID_NDK_ROOT)" || \
+		(echo "[ERROR] ANDROID_NDK_ROOT not found: $(ANDROID_NDK_ROOT)" && exit 1)
+
+help:
+	@echo ""
+	@echo "TMANLinearA8 FP16 全链路测试"
+	@echo ""
+	@echo "  x86 模拟器："
+	@echo "    make -f Makefile.linear_a8 run_x86"
+	@echo ""
+	@echo "  离线编译 context："
+	@echo "    make -f Makefile.linear_a8 compile_context"
+	@echo ""
+	@echo "  骁龙 8 Gen 3 / HTP v75 设备端执行："
+	@echo "    make -f Makefile.linear_a8 push_v75"
+	@echo "    make -f Makefile.linear_a8 exec_v75"
+	@echo "    make -f Makefile.linear_a8 run_v75"
+	@echo ""

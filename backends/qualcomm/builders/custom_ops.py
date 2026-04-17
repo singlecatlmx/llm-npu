@@ -124,6 +124,86 @@ def tman_linear_fake(
     return x.new_zeros(out_shape)
 
 
+@torch.library.custom_op("tman::linear_a8", mutates_args=())
+def tman_linear_a8(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> torch.Tensor:
+    """
+    这是正式 W4A8 路径在 Python/eager 侧的参考语义。
+
+    作用不是追求性能，而是保证：
+    1. 导出前 eager 行为与 runtime 的数学语义一致；
+    2. fake tensor / shape propagation 能够顺利通过；
+    3. builder 下沉前，图里已经显式携带 input_scale / output_scale。
+
+    当前语义为：
+    - 输入按外部 input_scale 做对称 A8 量化，再反量化回 fp；
+    - 权重仍按 GPTQ 规则反量化；
+    - 输出再按外部 output_scale 做一次量化反量化；
+    - 最终对外保持 fp16/fp32 浮点接口。
+    """
+    out_features = qweight.shape[1]
+    out_shape = x.shape[:-1] + (out_features,)
+    x_2d = x.reshape(-1, x.shape[-1])
+    weights = _dequantize_weight(
+        qweight,
+        scales,
+        qzeros,
+        g_idx,
+        wf_unsqueeze_zero,
+        wf_unsqueeze_neg_one,
+        bits,
+    ).to(x.dtype)
+
+    # 正式 W4A8 路径使用外部导入的 per-layer input_scale，
+    # 不再在 eager/runtime 内部重新估计激活 scale。
+    del output_scale
+    x_scale = input_scale.reshape(1, 1).to(x_2d.dtype)
+    x_scale = x_scale.clamp(min=1.0 / 127.0)
+    x_q = (x_2d / x_scale).round().clamp(-127, 127)
+    x_dq = x_q * x_scale
+
+    out = torch.matmul(x_dq, weights).reshape(out_shape)
+    # 输出端也做一次量化再反量化，模拟 runtime FinalizeA8 的输出误差模型。
+    out_scale = output_scale.reshape(1, 1).to(out.dtype).clamp(min=1.0 / 127.0)
+    out_q = (out.reshape(-1, out.shape[-1]) / out_scale).round().clamp(-127, 127)
+    out_dq = (out_q * out_scale).reshape(out_shape)
+    return out_dq.to(x.dtype)
+
+
+@tman_linear_a8.register_fake
+def tman_linear_a8_fake(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+    input_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> torch.Tensor:
+    out_features = qweight.shape[1]
+    out_shape = x.shape[:-1] + (out_features,)
+    return x.new_zeros(out_shape)
+
+
 @torch.library.custom_op("tman::bitnet_linear", mutates_args=())
 def tman_bitnet_linear(
     x: torch.Tensor,

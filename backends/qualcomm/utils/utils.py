@@ -26,6 +26,7 @@ from executorch.backends.qualcomm.builders.node_visitor import (
 from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.builders.custom_ops import (
     tman_linear,
+    tman_linear_a8,
     tman_bitnet_linear,
 )
 from executorch.backends.qualcomm.builders.utils import unpack_weights, unpack_gptqv2
@@ -280,6 +281,34 @@ class TMANLinear(torch.nn.Module):
         return s.format(**self.__dict__)
 
 
+class TMANLinearA8(TMANLinear):
+    def __init__(self, qlinear: torch.nn.Module, n_splits: int = 1):
+        super().__init__(qlinear, n_splits=n_splits)
+        # 两个 scale 都以 buffer 形式挂在模块上，原因是：
+        # 1. 它们不是可训练参数；
+        # 2. export/lowering 时需要作为静态张量进入图中；
+        # 3. 这样 apply_tman_a8_activation_scales 可以直接原地写入。
+        self.register_buffer("input_scale", torch.ones((1,), dtype=torch.float32))
+        self.register_buffer("output_scale", torch.ones((1,), dtype=torch.float32))
+
+    def forward(self, x):
+        return tman_linear_a8(
+            x,
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.g_idx,
+            self.wf_unsqueeze_zero,
+            self.wf_unsqueeze_neg_one,
+            self.group_size,
+            self.bits,
+            self.symmetric,
+            self.gptq_v2,
+            self.input_scale,
+            self.output_scale,
+        )
+
+
 def convert_qlinear_to_tman_linear(module: torch.nn.Module):
     # 动态导入gptqmodel组件以避免循环导入问题
     try:
@@ -313,6 +342,148 @@ def convert_qlinear_to_tman_linear(module: torch.nn.Module):
         return module
 
     return replace_qlinear(module)
+
+
+def convert_qlinear_to_tman_linear_a8(module: torch.nn.Module):
+    try:
+        import importlib
+
+        qlinear_base_module = importlib.import_module("gptqmodel.nn_modules.qlinear")
+        BaseQuantLinear = getattr(qlinear_base_module, "BaseQuantLinear")
+        torch_qlinear_module = importlib.import_module(
+            "gptqmodel.nn_modules.qlinear.torch"
+        )
+        TorchQuantLinear = getattr(torch_qlinear_module, "TorchQuantLinear")
+    except ImportError as e:
+        try:
+            from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+        except ImportError as e2:
+            raise RuntimeError(
+                f"无法导入gptqmodel组件: 动态导入失败({e}), 直接导入失败({e2})"
+            )
+
+    def replace_qlinear(module: torch.nn.Module):
+        attr_strs = dir(module)
+        if isinstance(module, torch.nn.ModuleList):
+            attr_strs += [str(i) for i in range(len(module))]
+
+        for attr_str in attr_strs:
+            target_attr = getattr(module, attr_str)
+            if isinstance(target_attr, BaseQuantLinear):
+                if not isinstance(target_attr, TorchQuantLinear):
+                    raise RuntimeError("Only GPTQ TorchQuantLinear backend is supported")
+                target_attr.post_init()
+                setattr(module, attr_str, TMANLinearA8(target_attr))
+
+        for _, sub_module in module.named_children():
+            sub_module = replace_qlinear(sub_module)
+        return module
+
+    return replace_qlinear(module)
+
+
+def load_tman_a8_activation_scales(scale_path: str) -> dict[str, float]:
+    """
+    从外部 activation_scales_a8_per-tensor_sym.pt 中提取扁平 scale 字典。
+
+    当前真实文件格式是：
+      model.model.layers.0.self_attn.q_proj.input_scale
+      model.model.layers.0.self_attn.q_proj.output_scale
+      ...
+
+    这里统一转换成 {key -> float}，方便后续模块名匹配。
+    """
+    state = torch.load(scale_path, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"Unexpected activation scale file format at {scale_path}: {type(state)}"
+        )
+
+    scale_map: dict[str, float] = {}
+    for key, value in state.items():
+        if not isinstance(key, str):
+            continue
+        if not (key.endswith(".input_scale") or key.endswith(".output_scale")):
+            continue
+
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise RuntimeError(
+                    f"Activation scale tensor for {key} must be scalar, got shape {tuple(value.shape)}"
+                )
+            scale_map[key] = float(value.reshape(-1)[0].item())
+        elif isinstance(value, (float, int)):
+            scale_map[key] = float(value)
+        else:
+            raise RuntimeError(
+                f"Unsupported activation scale value type for {key}: {type(value)}"
+            )
+    if not scale_map:
+        raise RuntimeError(f"No activation scales found in {scale_path}")
+    return scale_map
+
+
+def _resolve_tman_a8_scale_key(
+    module_name: str,
+    suffix: str,
+    scale_map: dict[str, float],
+) -> str | None:
+    # 这里同时兼容两类命名：
+    # 1. 直接就是 module_name.input_scale
+    # 2. 前面带 model. / model.model. 这样的完整前缀
+    #
+    # 这样做的目的是减少导出侧模型包装层级变化时的脆弱性。
+    candidates = [
+        f"{module_name}.{suffix}",
+        f"model.{module_name}.{suffix}",
+    ]
+    for candidate in candidates:
+        if candidate in scale_map:
+            return candidate
+
+    suffix_pattern = f".{module_name}.{suffix}"
+    matches = [key for key in scale_map.keys() if key.endswith(suffix_pattern)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def apply_tman_a8_activation_scales(
+    module: torch.nn.Module,
+    scale_map: dict[str, float],
+) -> None:
+    """
+    把外部 scale 文件中的 input/output scale 写回 TMANLinearA8 模块。
+
+    这里选择“严格失败”策略：
+    - 如果某个 TMANLinearA8 没找到 input/output scale，就直接报错；
+    - 不允许悄悄回退到默认值，避免合作者测试时出现“能跑但量化语义是错的”。
+    """
+    missing: list[str] = []
+    applied = 0
+
+    for name, submodule in module.named_modules():
+        if not isinstance(submodule, TMANLinearA8):
+            continue
+        input_key = _resolve_tman_a8_scale_key(name, "input_scale", scale_map)
+        output_key = _resolve_tman_a8_scale_key(name, "output_scale", scale_map)
+        if input_key is None or output_key is None:
+            missing.append(name)
+            continue
+
+        submodule.input_scale.copy_(torch.tensor([scale_map[input_key]], dtype=torch.float32))
+        submodule.output_scale.copy_(torch.tensor([scale_map[output_key]], dtype=torch.float32))
+        applied += 1
+
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(
+            "Missing W4A8 activation scales for TMAN modules: "
+            f"{preview}" + (" ..." if len(missing) > 8 else "")
+        )
+    if applied == 0:
+        raise RuntimeError("No TMANLinearA8 modules were matched for activation scales")
 
 
 # https://github.com/huggingface/transformers/pull/37742

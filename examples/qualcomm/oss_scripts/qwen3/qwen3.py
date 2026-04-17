@@ -49,15 +49,18 @@ from executorch.backends.qualcomm.utils.constants import (
     QCOM_QUANT_ATTRS_MAP,
 )
 from executorch.backends.qualcomm.utils.utils import (
+    apply_tman_a8_activation_scales,
     convert_linear_to_conv2d,
     convert_linear_to_qlinear,
     convert_qlinear_to_tman_linear,
+    convert_qlinear_to_tman_linear_a8,
     convert_qlinear_to_linear,
     generate_composite_llama_program,
     generate_htp_compiler_spec,
     generate_multi_graph_program,
     generate_qnn_executorch_compiler_spec,
     get_soc_to_chipset_map,
+    load_tman_a8_activation_scales,
     to_edge_transform_and_lower_to_qnn,
     update_spill_fill_size,
 )
@@ -509,11 +512,16 @@ class SingleLlama:
 def compile(args, pte_filename, tokenizer):
     os.makedirs(args.artifact, exist_ok=True)
     start_ts = time.time()
+    # 这里把 TMAN 的三种状态显式打印出来：
+    # - Disabled：完全不走 TMAN
+    # - W4A16：走旧 TMAN 路径
+    # - W4A8：走这次新增的正式 W4A8 路径
+    use_tman_mode = "W4A8" if args.use_tman_a8 else ("W4A16" if args.use_tman else "Disabled")
 
     # 打印环境配置信息
     logging.info("📱 === Xiaomi 14 (SM8650) Compilation Configuration ===")
     logging.info(f"🎯 Target: {args.model} ({args.soc_model if hasattr(args, 'soc_model') else 'SM8650'})")
-    logging.info(f"🔧 TMAN: {'Enabled' if args.use_tman else 'Disabled'}")
+    logging.info(f"🔧 TMAN: {use_tman_mode}")
     logging.info(f"📊 Quantization: {args.ptq if args.ptq else 'None'}")
     
     # 检查QNN OpPackage配置
@@ -526,6 +534,10 @@ def compile(args, pte_filename, tokenizer):
                 lib_path, provider, backend = parts[0], parts[1], parts[2]
                 exists = os.path.exists(lib_path)
                 logging.info(f"   - {backend}: {lib_path} {'✅' if exists else '❌'}")
+        if args.use_tman_a8 and "TMANOpPackageW4A8" not in qnn_op_paths:
+            logging.warning(
+                "⚠️ --use_tman_a8 is enabled, but QNN_OP_PACKAGE_PATHS does not appear to point to the TMANOpPackageW4A8 runtime package."
+            )
     else:
         logging.warning("❌ QNN_OP_PACKAGE_PATHS not set!")
     
@@ -570,6 +582,20 @@ def compile(args, pte_filename, tokenizer):
         raise RuntimeError(
             "desc_act=True is unsupported right now."
         )
+    tman_a8_scale_map = None
+    if args.use_tman_a8:
+        # W4A8 正式路径依赖外部标定好的激活 scale 文件。
+        # 如果这里缺失，后面的 runtime 即使能编过，量化语义也不成立，
+        # 因此直接在 compile 阶段报错是更安全的做法。
+        scale_path = (
+            args.tman_a8_scale_path
+            if args.tman_a8_scale_path is not None
+            else os.path.join(args.model_dir, "activation_scales_a8_per-tensor_sym.pt")
+        )
+        logging.info(f"Loading TMAN W4A8 activation scales from: {scale_path}")
+        if not os.path.exists(scale_path):
+            raise RuntimeError(f"TMAN W4A8 activation scale file not found: {scale_path}")
+        tman_a8_scale_map = load_tman_a8_activation_scales(scale_path)
     
     # 使用动态导入避免循环导入
     try:
@@ -633,7 +659,13 @@ def compile(args, pte_filename, tokenizer):
 
     for llama_instance in llama_instance_list:
         for layer in llama_instance.model.layers:
-            if args.use_tman:
+            if args.use_tman_a8:
+                # 先把 GPTQ 线性层替换成带 input/output scale 的 TMANLinearA8 模块，
+                # attention 再切到 prepare_tman 对应的 forward 结构。
+                convert_qlinear_to_tman_linear_a8(layer.self_attn)
+                layer.self_attn.prepare_tman()
+                convert_qlinear_to_tman_linear_a8(layer.mlp)
+            elif args.use_tman:
                 convert_qlinear_to_tman_linear(layer.self_attn)
                 layer.self_attn.prepare_tman()
                 convert_qlinear_to_tman_linear(layer.mlp)
@@ -641,6 +673,9 @@ def compile(args, pte_filename, tokenizer):
                 convert_qlinear_to_linear(layer.self_attn)
                 layer.self_attn.prepare_sha()
                 convert_qlinear_to_linear(layer.mlp)
+        if args.use_tman_a8:
+            # scale 注入放在整层替换完成之后做，避免模块还没换完时就开始按名字匹配。
+            apply_tman_a8_activation_scales(llama_instance, tman_a8_scale_map)
 
     use_fp16 = True
     fixed_point_type = {"kv_type": torch.float32, "io_type": torch.float32}
@@ -679,7 +714,10 @@ def compile(args, pte_filename, tokenizer):
         # 设置量化缓存文件路径
         cache_dir = os.path.join(args.artifact, "quantized_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file = os.path.join(cache_dir, f"quantized_model_{args.ptq}_{args.model_mode}_{args.use_tman}.pt")
+        cache_file = os.path.join(
+            cache_dir,
+            f"quantized_model_{args.ptq}_{args.model_mode}_{use_tman_mode}.pt",
+        )
         
         # 检查是否存在量化缓存
         if os.path.exists(cache_file) and not args.force_quantize:
@@ -1231,6 +1269,19 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--use_tman_a8",
+        action="store_true",
+        help="Use the formal W4A8 TMANLinearA8 path instead of QNNConv2d.",
+    )
+
+    parser.add_argument(
+        "--tman_a8_scale_path",
+        type=str,
+        default=None,
+        help="Optional path to activation_scales_a8_per-tensor_sym.pt for the W4A8 TMAN path. Defaults to <model_dir>/activation_scales_a8_per-tensor_sym.pt.",
+    )
+
+    parser.add_argument(
         "--force_quantize",
         action="store_true",
         help="Force re-quantization even if cache exists.",
@@ -1242,6 +1293,9 @@ def _build_parser():
 
 
 def export_llama(args) -> None:
+    if args.use_tman and args.use_tman_a8:
+        raise RuntimeError("Only one of --use_tman and --use_tman_a8 can be enabled.")
+
     if args.compile_only and args.pre_gen_pte:
         exit("Cannot set both compile_only and pre_gen_pte as true")
 
