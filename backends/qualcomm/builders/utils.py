@@ -46,6 +46,31 @@ def get_parameter(
     return param
 
 
+def to_plain_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Materialize tensor subclasses as a regular CPU tensor before builder-side
+    numpy conversion. W4A8-exported constants may be lifted as tensor
+    subclasses, and `.numpy()` is not implemented on those wrappers.
+    """
+    assert isinstance(tensor, torch.Tensor), "Expect tensor input"
+    if isinstance(tensor, torch._subclasses.fake_tensor.FakeTensor):
+        constant = getattr(tensor, "constant", None)
+        if constant is None:
+            raise RuntimeError(
+                "Cannot materialize a FakeTensor without constant data."
+            )
+        tensor = constant
+    with torch._C.DisableTorchFunctionSubclass():
+        plain_tensor = tensor.detach().as_subclass(torch.Tensor)
+    if plain_tensor.device.type != "cpu":
+        plain_tensor = plain_tensor.cpu()
+    return plain_tensor.contiguous()
+
+
+def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    return to_plain_tensor(tensor).numpy()
+
+
 def set_parameter(
     param: torch.Tensor, node: torch.fx.Node, edge_program: torch.export.ExportedProgram
 ):
@@ -248,9 +273,9 @@ def hvx_preprocess_weights(
             # = (c * ls + (z * 2 + 1) * lb) * s
             zeros = zeros * 2 + 1
             scales = np.stack([scales, zeros], axis=-2)
-        scales = scales.view(np.int32).reshape(P // tile_p, -1)
+        scales = np.ascontiguousarray(scales).view(np.int32).reshape(P // tile_p, -1)
     else:  # BitNet
-        scales = scales.view(np.uint16).reshape(1, -1)
+        scales = np.ascontiguousarray(scales).view(np.uint16).reshape(1, -1)
         # [ERROR] [Qnn ExecuTorch]: QnnDsp <E> Dma execution failed on the skel side. result = 1100 transport error = 0
         # Padding to vec_p
         # TODO: verify if the padding is needed

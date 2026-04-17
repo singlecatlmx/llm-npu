@@ -928,15 +928,17 @@ inline void tman_w4a8_finalize_fp16_with_output_scale(
     return;
   }
 
-  std::vector<__fp16> tmp(static_cast<size_t>(gemm_m), static_cast<__fp16>(0.0f));
-  hvx_bit_serial<__fp16, float, 4>(gemm_m, gemm_n, c_ptr, tmp.data());
+  // 先直接把 bit-serial 输出写到 QNN 分配的最终输出 buffer。
+  // 相比写入临时 std::vector<__fp16>，这条路径与旧 TMANFinalize 更一致，
+  // 也能避免真机上临时 buffer 对齐/存储方式与 HVX 写回要求不匹配。
+  hvx_bit_serial<__fp16, float, 4>(gemm_m, gemm_n, c_ptr, y_ptr);
   for (int32_t m = 0; m < gemm_m; ++m) {
     // 这里显式做“量化再反量化”而不是直接乘 output_scale，
     // 目的是把输出激活限制到目标 A8 格式的离散水平上，再恢复为 fp16。
-    const float y_fp = static_cast<float>(tmp[static_cast<size_t>(m)]);
+    const float y_fp = static_cast<float>(y_ptr[static_cast<size_t>(m)]);
     const int8_t y_q = tman_w4a8_round_clip_int8(y_fp / output_scale);
-    y_ptr[static_cast<size_t>(m)] = static_cast<__fp16>(
-        static_cast<float>(y_q) * output_scale);
+    y_ptr[static_cast<size_t>(m)] =
+        static_cast<__fp16>(static_cast<float>(y_q) * output_scale);
   }
 }
 

@@ -11,7 +11,12 @@ import executorch.backends.qualcomm.python.PyQnnWrapperAdaptor as PyQnnWrapper
 import numpy as np
 import torch
 from executorch.backends.qualcomm.utils.constants import QCOM_DATA
-from executorch.backends.qualcomm.builders.utils import unpack_gptqv2, hvx_preprocess_weights, unpack_weights
+from executorch.backends.qualcomm.builders.utils import (
+    hvx_preprocess_weights,
+    tensor_to_numpy,
+    unpack_gptqv2,
+    unpack_weights,
+)
 import logging
 
 from .node_visitor import NodeVisitor, register_node_visitor
@@ -28,6 +33,20 @@ from .utils import get_parameter
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _make_fake_gptq_placeholders(
+    qweight_tensor: torch.Tensor,
+    bits: int,
+    group_size: int,
+    symmetric: bool,
+):
+    k = qweight_tensor.shape[0] * (32 // bits)
+    m = qweight_tensor.shape[1]
+    qweight_repacked = np.zeros((m, k), dtype=np.uint8)
+    scales_repacked = np.ones((m, k // group_size), dtype=np.float16)
+    zeros_repacked = None if symmetric else np.zeros_like(scales_repacked)
+    return qweight_repacked, scales_repacked, zeros_repacked
 
 
 def _get_c_size(
@@ -116,15 +135,22 @@ class TMANLinear(NodeVisitor):
             symmetric = cast(bool, node.args[9])
             gptq_v2 = cast(bool, node.args[10])
 
-            qweight_repacked, scales_repacked, zeros_repacked, ref_bits, ref_group_size, ref_symmetric = unpack_gptqv2(
-                qweight_tensor.detach().numpy(),
-                scales_tensor.detach().numpy(),
-                qzeros_tensor.detach().numpy(),
-                gptq_v2,
-            )
-            assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
-                f"TMANLinear: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
-            )
+            if isinstance(qweight_tensor, torch._subclasses.fake_tensor.FakeTensor):
+                qweight_repacked, scales_repacked, zeros_repacked = (
+                    _make_fake_gptq_placeholders(
+                        qweight_tensor, bits, group_size, symmetric
+                    )
+                )
+            else:
+                qweight_repacked, scales_repacked, zeros_repacked, ref_bits, ref_group_size, ref_symmetric = unpack_gptqv2(
+                    tensor_to_numpy(qweight_tensor),
+                    tensor_to_numpy(scales_tensor),
+                    tensor_to_numpy(qzeros_tensor),
+                    gptq_v2,
+                )
+                assert ref_bits == bits and ref_group_size == group_size and ref_symmetric == symmetric, (
+                    f"TMANLinear: bits/group_size/symmetric mismatch, {ref_bits}/{ref_group_size}/{ref_symmetric} != {bits}/{group_size}/{symmetric}"
+                )
         elif node.target.__name__ == "tman.bitnet_linear.default":
             qweight_node = node.args[1]
             qweight_tensor = get_parameter(qweight_node, self.edge_program)
@@ -134,8 +160,12 @@ class TMANLinear(NodeVisitor):
             bits = 2
             symmetric = True
 
-            qweight_repacked = (unpack_weights(qweight_tensor.detach(), dtype=torch.int8) + 2).to(torch.uint8).numpy()
-            scales_repacked = scales_tensor.detach().numpy()
+            qweight_repacked = tensor_to_numpy(
+                (unpack_weights(qweight_tensor.detach(), dtype=torch.int8) + 2).to(
+                    torch.uint8
+                )
+            )
+            scales_repacked = tensor_to_numpy(scales_tensor)
             zeros_repacked = None
         else:
             raise NotImplementedError(f"Unsupported node target: {node.target.__name__}")

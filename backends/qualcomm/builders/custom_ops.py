@@ -169,7 +169,7 @@ def tman_linear_a8(
 
     # 正式 W4A8 路径使用外部导入的 per-layer input_scale，
     # 不再在 eager/runtime 内部重新估计激活 scale。
-    del output_scale
+    # del output_scale
     x_scale = input_scale.reshape(1, 1).to(x_2d.dtype)
     x_scale = x_scale.clamp(min=1.0 / 127.0)
     x_q = (x_2d / x_scale).round().clamp(-127, 127)

@@ -43,6 +43,7 @@ from .utils import (
     is_graph_input,
     is_graph_output,
     is_parameter,
+    tensor_to_numpy,
 )
 
 
@@ -151,7 +152,7 @@ class NodeVisitor:
 
         quant_config[QCOM_NUM_BLOCKS_PER_AXIS] = quantized_scales[0].shape.numel()
         quant_config[QCOM_BLOCK_SCALE_OFFSET] = scale_offset
-        quant_config[QCOM_BLOCK_SCALES] = torch.cat(quantized_scales).detach().numpy()
+        quant_config[QCOM_BLOCK_SCALES] = tensor_to_numpy(torch.cat(quantized_scales))
         # e.g. if use 16 bit for quantized scales, we need to expand 16 - 4 = 12 bits
         quant_config[QCOM_BLOCK_SCALE_BITWIDTH] = (
             int(math.log2(torch.iinfo(quant_scales_dtype).max + 1)) - bitwidth_of_scale
@@ -446,7 +447,7 @@ class NodeVisitor:
                 len(nominal_dims),
                 nominal_dims,
                 dynamic_dims,
-                tensor.detach().numpy(),
+                tensor_to_numpy(tensor),
                 True,
             )
         nodes_to_wrappers[node_name][wrapper_idx] = tensor_wrapper
