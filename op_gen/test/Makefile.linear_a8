@@ -19,7 +19,7 @@ TMAN_HEXAGON_TOOLS_VERSION_V75 ?= 19.0.04
 
 # 单测默认使用 op_gen 下的开发包源码，避免与 runtime 正式包混用。
 # 等 op_gen 侧设备/模拟器验证稳定后，再将修改回迁到 runtime/op_packages。
-#OP_PKG_DIR ?= ../TMANOpPackage-dev
+# OP_PKG_DIR ?= ../TMANOpPackage-dev
 OP_PKG_DIR ?= ../../backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8
 OP_PKG_MAKEFLAGS ?= -B
 OP_PACKAGE_NAME := TMANOpPackage

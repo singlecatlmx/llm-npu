@@ -1,6 +1,12 @@
 w4a8_fp16_autosplit_pipeline_graph 41 w4a8_fp16_autosplit_x 48 w4a8_fp16_autosplit_y 1 1 1 256 1 1 1 256
 w4a8_fp16_basic_pipeline_graph 1 w4a8_fp16_basic_x 8 w4a8_fp16_basic_y 1 1 1 256 1 1 1 128
+w4a8_fp16_chunk_m128_k6144_pipeline_graph 57 w4a8_fp16_chunk_m128_k6144_x 64 w4a8_fp16_chunk_m128_k6144_y 1 1 1 6144 1 1 1 128
+w4a8_fp16_chunk_m512_k2048_pipeline_graph 49 w4a8_fp16_chunk_m512_k2048_x 56 w4a8_fp16_chunk_m512_k2048_y 1 1 1 2048 1 1 1 512
 w4a8_fp16_multigroup_pipeline_graph 25 w4a8_fp16_multigroup_x 32 w4a8_fp16_multigroup_y 1 1 1 512 1 1 1 128
 w4a8_fp16_output_scale_pipeline_graph 33 w4a8_fp16_output_scale_x 40 w4a8_fp16_output_scale_y 1 1 1 256 1 1 1 128
 w4a8_fp16_zero_input_pipeline_graph 9 w4a8_fp16_zero_input_x 16 w4a8_fp16_zero_input_y 1 1 1 256 1 1 1 128
 w4a8_fp16_zero_weight_pipeline_graph 17 w4a8_fp16_zero_weight_x 24 w4a8_fp16_zero_weight_y 1 1 1 256 1 1 1 128
+w4a8_qwen_m1024_k2048_pipeline_graph 65 w4a8_qwen_m1024_k2048_x 72 w4a8_qwen_m1024_k2048_y 1 1 1 2048 1 1 1 1024
+w4a8_qwen_m2048_k2048_pipeline_graph 73 w4a8_qwen_m2048_k2048_x 80 w4a8_qwen_m2048_k2048_y 1 1 1 2048 1 1 1 2048
+w4a8_qwen_m2048_k6144_pipeline_graph 81 w4a8_qwen_m2048_k6144_x 88 w4a8_qwen_m2048_k6144_y 1 1 1 6144 1 1 1 2048
+w4a8_qwen_m6144_k2048_pipeline_graph 89 w4a8_qwen_m6144_k2048_x 96 w4a8_qwen_m6144_k2048_y 1 1 1 2048 1 1 1 6144

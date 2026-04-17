@@ -137,43 +137,29 @@ GraphStatus tmanprecomputea8Impl(
       static_cast<int32_t>(input_scale_dims[2]) != 1 || static_cast<int32_t>(input_scale_dims[3]) != 1) {
     return GraphStatus::ErrorDimensions;
   }
-  // 先切回之前更稳定的标量 reference precompute。
-  // 目标不是最终性能，而是恢复那版“基础 6 个 case 能通过”的基线，
-  // 继续专注定位多 p_tile / 大 shape 的端侧问题。
-  const float inv_s_a = 1.0f / s_a;
-  const int32_t num_groups = gemm_k / group_size;
-  for (int32_t i = 0; i < MAX(ls_size, 128 / static_cast<int32_t>(sizeof(float))); ++i) {
-    ls_ptr[i] = (i < ls_size) ? s_a : 0.0f;
-  }
-  for (int32_t i = 0; i < MAX(num_groups, 128 / static_cast<int32_t>(sizeof(float))); ++i) {
-    lb_ptr[i] = 0.0f;
-  }
-
-  int32_t group_sum = 0;
-  int32_t group_idx = 0;
-  for (int32_t q = 0; q < gemm_k / 4; ++q) {
-    const int32_t base = q * 4;
-    const int32_t q0 = static_cast<int32_t>(
-        tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[base + 0]) * inv_s_a));
-    const int32_t q1 = static_cast<int32_t>(
-        tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[base + 1]) * inv_s_a));
-    const int32_t q2 = static_cast<int32_t>(
-        tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[base + 2]) * inv_s_a));
-    const int32_t q3 = static_cast<int32_t>(
-        tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[base + 3]) * inv_s_a));
-
-    tman_w4a8_build_signed_lut_from_int8(q0, q1, q2, q3, l_ptr + q * 16);
-    group_sum += q0 + q1 + q2 + q3;
-
-    if (((base + 4) % group_size) == 0) {
-      lb_ptr[group_idx++] = -0.5f * static_cast<float>(group_sum) * s_a;
-      group_sum = 0;
-    }
+  // 恢复回与 hvx_tbl(...) 契约一致的 hvx_lut_ctor 路线：
+  // 1. 仍严格使用外部 input_scale；
+  // 2. 先按 input_scale 量化到 A8；
+  // 3. 再反量化回 fp16；
+  // 4. 由 hvx_lut_ctor 统一生成 [lut][ls][lb]。
+  //
+  // 这样可以最大程度保证 PrecomputeA8 的输出与 LinearA8/hvx_tbl 的
+  // 既有消费语义一致。
+  const float inv_s_a = (s_a == 0.0f) ? 0.0f : (1.0f / s_a);
+  std::vector<XType> x_quantized(
+      static_cast<size_t>(gemm_k),
+      static_cast<XType>(0.0f));
+  for (int32_t k = 0; k < gemm_k; ++k) {
+    const int8_t q_a =
+        tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[k]) * inv_s_a);
+    x_quantized[static_cast<size_t>(k)] =
+        static_cast<XType>(static_cast<float>(q_a) * s_a);
   }
 
-  if (group_idx != num_groups) {
-    return GraphStatus::ErrorFatal;
-  }
+  constexpr int32_t ACT_GROUP_SIZE = 256;
+  constexpr int32_t LUT_G = 4;
+  hvx_lut_ctor<LType, XType, ACT_GROUP_SIZE, 128, false, LUT_G>(
+      gemm_k, gemm_n, x_quantized.data(), l_ptr, ls_ptr, lb_ptr);
   return GraphStatus::Success;
 }
 
