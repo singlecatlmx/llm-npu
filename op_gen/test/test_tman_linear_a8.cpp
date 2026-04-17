@@ -743,6 +743,48 @@ static std::vector<CaseSpec> get_cases() {
           256,
           1024,
           0.20f),
+      make_case(
+          "w4a8_fp16_chunk_m512_k2048",
+          "TMAN W4A8 FP16 全链路: autosplit 等价单 chunk M512 K2048",
+          512,
+          2048,
+          2048,
+          0.50f),
+      make_case(
+          "w4a8_fp16_chunk_m128_k6144",
+          "TMAN W4A8 FP16 全链路: autosplit 等价单 chunk M128 K6144",
+          128,
+          6144,
+          512,
+          0.75f),
+      make_case(
+          "w4a8_qwen_m1024_k2048",
+          "TMAN W4A8 FP16 全链路: Qwen3 shape M1024 K2048",
+          1024,
+          2048,
+          2048,
+          0.50f),
+      make_case(
+          "w4a8_qwen_m2048_k2048",
+          "TMAN W4A8 FP16 全链路: Qwen3 shape M2048 K2048",
+          2048,
+          2048,
+          2048,
+          0.50f),
+      make_case(
+          "w4a8_qwen_m2048_k6144",
+          "TMAN W4A8 FP16 全链路: Qwen3 shape M2048 K6144",
+          2048,
+          6144,
+          512,
+          0.75f),
+      make_case(
+          "w4a8_qwen_m6144_k2048",
+          "TMAN W4A8 FP16 全链路: Qwen3 shape M6144 K2048",
+          6144,
+          2048,
+          2048,
+          0.75f),
   };
 }
 

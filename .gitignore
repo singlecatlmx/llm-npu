@@ -45,3 +45,4 @@ xcuserdata/
 .swiftpm/
 *.xcworkspace/
 *.xcframework/
+op_gen/

@@ -11,7 +11,6 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
-#include <vector>
 #include <hexagon_types.h>
 #include <type_traits>
 

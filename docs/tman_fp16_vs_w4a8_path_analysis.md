@@ -356,3 +356,189 @@ No quant config is implemented for op, tman.linear_a8.default
 - 当前主要卡在 host 侧编译链路，还没有稳定进入“设备侧数值和性能问题”阶段
 
 这也是为什么现阶段看到 `fp16` 通、`W4A8` 挂，是合理且符合工程现状的。
+
+## 14. Runtime 契约分析
+
+下面这部分记录当前对 runtime 包里 `PrecomputeA8 -> LinearA8 -> FinalizeA8`
+这条链路的更细粒度判断。
+
+### 14.1 当前更可疑的不是单点低级错误，而是契约不完全一致
+
+在正式包里：
+
+- [TMANPrecomputeA8.cpp](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/src/ops/TMANPrecomputeA8.cpp)
+- [TMANLinearA8.cpp](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/src/ops/TMANLinearA8.cpp)
+- [hvx_funcs.h](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/include/hvx_funcs.h)
+
+三者之间目前最大的风险点，不是“某一行明显写反了”，而是：
+
+- `PrecomputeA8` 写出的 `[lut][ls][lb]`
+- `LinearA8` 读取 `[lut][ls][lb]` 的方式
+- 以及 `hvx_tbl(...)` 内部对 `ls/lb` 的使用时机
+
+这三者未必完全一致。
+
+### 14.2 PrecomputeA8 当前语义
+
+[TMANPrecomputeA8.cpp](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/src/ops/TMANPrecomputeA8.cpp)
+当前采用的是“保守标量参考实现”：
+
+1. 使用外部 `input_scale`
+2. 对输入做 `q_a = round_clip(x / s_a)`
+3. 每四个激活生成一个 16-entry signed LUT
+4. `ls[i] = s_a`
+5. `lb[group] = -0.5 * sum(q_a) * s_a`
+
+这条实现本身是自洽的，而且适合作为正确性优先路径。
+
+### 14.3 LinearA8 当前读取方式
+
+[TMANLinearA8.cpp](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/src/ops/TMANLinearA8.cpp)
+里最终调用的是：
+
+```cpp
+hvx_tbl<LType, XType, CType, ACT_GROUP_SIZE, 128, false, 4, TILE_K, LUT_G, true>(
+    gemm_m, gemm_k, gemm_n, l_ptr, ls_ptr, lb_ptr, w_ptr, s_ptr, c_ptr);
+```
+
+也就是说，真正决定数值行为的是
+[hvx_funcs.h](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/include/hvx_funcs.h)
+里的 `hvx_tbl(...)`。
+
+### 14.4 当前最值得怀疑的 3 个契约点
+
+#### 14.4.1 `lb` 的使用时机
+
+在 `PrecomputeA8` 里，`lb` 是按 group 写入：
+
+```cpp
+lb_ptr[group_idx++] = -0.5f * static_cast<float>(group_sum) * s_a;
+```
+
+而在 `hvx_tbl(...)` 里，`lb` 不是每一步都加，而是在
+
+- `cmp_blk_tail`
+- `q_group_tail`
+- `vec_p % (VecP * Bits) == VecP`
+
+这些条件成立时才被加进去，见：
+[hvx_funcs.h#L1413](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/include/hvx_funcs.h#L1413)
+到
+[hvx_funcs.h#L1471](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/include/hvx_funcs.h#L1471)
+
+这意味着：
+
+- `lb` 的数学定义即使正确
+- 如果它的“写入粒度”和 `hvx_tbl` 的“读取时机”不完全匹配
+- 也会出现系统性的符号或偏移错误
+
+#### 14.4.2 `ls` 的粒度
+
+`PrecomputeA8` 当前使用：
+
+- `ls_size = gemm_k / 256`
+- 每个 `ls` 槽位都写 `s_a`
+
+而 `hvx_tbl(...)` 读取时用的是：
+
+```cpp
+ls[(tile_q + vec_q) / q_act_group_size]
+```
+
+见 [hvx_funcs.h#L1423](/home/tang/llm-npu/backends/qualcomm/runtime/op_packages/TMANOpPackageW4A8/include/hvx_funcs.h#L1423)
+
+因此要求：
+
+- `ActGroupSize`
+- `q_act_group_size`
+- `tile_q`
+- `vec_q`
+
+和 `PrecomputeA8` 的 `ls` 布局必须完全一致。
+
+如果这里只是“看起来相同”但实际切块边界不一致，就会导致整组输出偏移。
+
+#### 14.4.3 LUT 顺序
+
+`PrecomputeA8` 构 LUT 时用的是：
+
+```cpp
+acc += (idx & 0x1) ? x0 : -x0;
+acc += (idx & 0x2) ? x1 : -x1;
+acc += (idx & 0x4) ? x2 : -x2;
+acc += (idx & 0x8) ? x3 : -x3;
+```
+
+而 `hvx_tbl(...)` 通过 `Q6_Wh_vlut16_VbVhR_nomatch(...)`
+从 LUT 中取值。
+
+如果：
+
+- `PrecomputeA8` 生成 LUT 的符号/索引顺序
+- 和 `hvx_tbl(...)` 假定的 LUT 顺序
+
+并不是同一套约定，那么即便 `ls/lb` 没问题，也会产生明显的数值偏差。
+
+### 14.5 当前最合理的怀疑顺序
+
+在 runtime 包里，如果继续沿实现排查，建议优先怀疑：
+
+1. `lb` 的定义与 `hvx_tbl(...)` 使用时机是否完全一致
+2. `ls` 的 group 粒度与 `q_act_group_size` 是否完全一致
+3. LUT 的生成顺序与 `Q6_Wh_vlut16_VbVhR_nomatch(...)` 的取值顺序是否一致
+
+相对来说，当前 `TMANPrecomputeA8.cpp` 本身没有明显的低级错误；
+更像是它与 `TMANLinearA8` / `hvx_tbl(...)` 的契约还需要进一步核对。
+
+### 14.6 一个新的重要判断：当前标量 PrecomputeA8 可能已经打破了 hvx_tbl 契约
+
+在正式包里，`TMANPrecomputeA8.cpp` 当前已经被切到一条“保守标量参考实现”：
+
+- 不再走 `hvx_lut_ctor(...)`
+- 而是直接写：
+  - signed LUT
+  - `ls = s_a`
+  - `lb = -0.5 * sum(q_a) * s_a`
+
+这条实现从局部数学上看是自洽的，但它未必仍然满足 `hvx_tbl(...)` 的原始契约。
+
+原因在于：
+
+- `hvx_tbl(...)` 不是一个“任意 `[lut][ls][lb]` 都能正确消费”的通用内核
+- 它实际上默认了：
+  1. LUT 的排列方式来自 `hvx_lut_ctor(...)`
+  2. `ls` 的粒度与 `q_act_group_size` 完全一致
+  3. `lb` 的数值定义与其内部 `q_group_tail / cmp_blk_tail` 的加法时机相匹配
+
+因此，一旦 `PrecomputeA8` 改成了另一种 LUT 生成策略，就会出现一个很关键的现象：
+
+- `x86` 和 `v75` 设备可能彼此对齐
+- 但整个 pipeline 的数学结果仍然不对
+
+这说明：
+
+- “设备与 x86 一致”
+- 不等于
+- “实现与目标数学语义一致”
+
+换句话说：
+
+- 之前把 `PrecomputeA8` 改成标量参考实现，更适合做“设备分支一致性验证”
+- 但它不一定还能作为“正式 runtime 全链路正确实现”
+
+这也是为什么：
+
+- 端侧 stage test 可能显示某些阶段都 pass
+- 但完整 runtime pipeline 在 x86 上仍然会出现明显的数值偏差
+
+当前更合理的推断是：
+
+- 如果要保持 `LinearA8` 不变，`PrecomputeA8` 最终仍然需要产出与 `hvx_lut_ctor(...)` 兼容的 packed 语义
+- 如果要保留当前这条更直观的标量 LUT 语义，那么 `LinearA8` / `hvx_tbl(...)` 也必须同步调整
+
+因此，当前 runtime 包的关键选择实际上是二选一：
+
+1. 回到 `hvx_lut_ctor(...)` 契约，确保 `PrecomputeA8` 与 `hvx_tbl(...)` 匹配
+2. 保留当前标量 LUT 语义，并同步重写 `LinearA8` 的消费逻辑
+
+从改动成本和风险看，第一条更接近现有正式包的设计思路。
