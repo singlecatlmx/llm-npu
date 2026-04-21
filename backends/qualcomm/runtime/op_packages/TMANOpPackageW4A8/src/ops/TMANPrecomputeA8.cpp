@@ -12,6 +12,7 @@
 #include "HTP/core/simple_reg.h"
 #include "QnnOpPackage.h"
 
+#include <cstdint>
 #include <vector>
 
 #include "hvx_funcs.h"
@@ -137,29 +138,34 @@ GraphStatus tmanprecomputea8Impl(
       static_cast<int32_t>(input_scale_dims[2]) != 1 || static_cast<int32_t>(input_scale_dims[3]) != 1) {
     return GraphStatus::ErrorDimensions;
   }
-  // 恢复回与 hvx_tbl(...) 契约一致的 hvx_lut_ctor 路线：
-  // 1. 仍严格使用外部 input_scale；
-  // 2. 先按 input_scale 量化到 A8；
-  // 3. 再反量化回 fp16；
-  // 4. 由 hvx_lut_ctor 统一生成 [lut][ls][lb]。
-  //
-  // 这样可以最大程度保证 PrecomputeA8 的输出与 LinearA8/hvx_tbl 的
-  // 既有消费语义一致。
+  // 仍然复用旧 TMAN 的 hvx_lut_ctor 数学语义，但显式给临时量化 buffer 预留
+  // 一段额外空间并手动对齐到 128B，避免真机上把普通 std::vector 地址直接喂给
+  // HVX 读路径时出现不稳定行为。
   const float inv_s_a = (s_a == 0.0f) ? 0.0f : (1.0f / s_a);
-  std::vector<XType> x_quantized(
-      static_cast<size_t>(gemm_k),
+  constexpr size_t kHvxAlignment = static_cast<size_t>(VLEN);
+  const size_t scratch_extra = kHvxAlignment / sizeof(XType);
+  std::vector<XType> x_quantized_storage(
+      static_cast<size_t>(gemm_k) + scratch_extra,
       static_cast<XType>(0.0f));
+  XType* x_quantized_ptr = x_quantized_storage.data();
+  if (x_quantized_ptr == nullptr) {
+    return GraphStatus::ErrorFatal;
+  }
+  const uintptr_t aligned_addr =
+      (reinterpret_cast<uintptr_t>(x_quantized_ptr) + kHvxAlignment - 1u) &
+      ~(static_cast<uintptr_t>(kHvxAlignment - 1u));
+  XType* x_quantized_aligned = reinterpret_cast<XType*>(aligned_addr);
   for (int32_t k = 0; k < gemm_k; ++k) {
     const int8_t q_a =
         tman_w4a8_round_clip_int8(static_cast<float>(x_ptr[k]) * inv_s_a);
-    x_quantized[static_cast<size_t>(k)] =
+    x_quantized_aligned[static_cast<size_t>(k)] =
         static_cast<XType>(static_cast<float>(q_a) * s_a);
   }
 
   constexpr int32_t ACT_GROUP_SIZE = 256;
   constexpr int32_t LUT_G = 4;
   hvx_lut_ctor<LType, XType, ACT_GROUP_SIZE, 128, false, LUT_G>(
-      gemm_k, gemm_n, x_quantized.data(), l_ptr, ls_ptr, lb_ptr);
+      gemm_k, gemm_n, x_quantized_aligned, l_ptr, ls_ptr, lb_ptr);
   return GraphStatus::Success;
 }
 
