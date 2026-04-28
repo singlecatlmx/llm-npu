@@ -40,3 +40,40 @@ xcuserdata/
 .swiftpm/
 *.xcworkspace/
 *.xcframework/
+
+# 构筑输出
+build-android/
+build-android_/
+build-android__/
+build-x86/
+build-x86_/
+build-x86__/
+buck2-cache/
+
+# QNN SDK
+QNNv2.44.0.260225/
+v2.44.0.260225.zip
+
+# 日志和临时输出
+# *.log
+# output.txt
+# hybrid_llama_qnn_quant_attrs.txt
+# qwen3_tman_hexagon_v75_*
+# qwen3_xiaomi14_compilation.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 杂项测试脚本（根据你需要取舍）
+# 1.py
+# check_torch_compatibility.py
+# check_torch_conflicts.py
+# test_installation.py
+# test_torchvision.py
+# test_torchvision_smart.py
+# verify_torch_protection.sh
+# quick_install.sh
+
+# 嵌入式 Git 仓库（如果你想保留 pcre2 的文件，见下方说明）
+pcre2/
