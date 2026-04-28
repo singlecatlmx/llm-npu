@@ -27,6 +27,7 @@ from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.builders.custom_ops import (
     tman_linear,
     tman_bitnet_linear,
+    tman_prefill_linear,
 )
 from executorch.backends.qualcomm.builders.utils import unpack_weights, unpack_gptqv2
 from executorch.backends.qualcomm.partition.qnn_partitioner import (
@@ -283,6 +284,97 @@ def convert_qlinear_to_tman_linear(module: torch.nn.Module):
     return replace_qlinear(module)
 
 
+class TMANPrefillLinear(torch.nn.Module):
+    def __init__(self, qlinear: torch.nn.Module, n_splits: int = 1):
+        super().__init__()
+        # GPTQv1: AutoGPTQ
+        # GPTQv2: GPTQModel
+        self.gptq_v2 = qlinear.qzero_format() == 2
+        self.in_features = qlinear.in_features
+        self.out_features = qlinear.out_features // n_splits
+
+        _, _, _, bits, group_size, symmetric = unpack_gptqv2(
+            qlinear.qweight.detach().numpy(),
+            qlinear.scales.detach().numpy(),
+            qlinear.qzeros.detach().numpy(),
+            self.gptq_v2,
+        )
+
+        if n_splits == 1:
+            self.qweight = torch.nn.Parameter(qlinear.qweight, requires_grad=False)
+            self.scales = torch.nn.Parameter(qlinear.scales, requires_grad=False)
+            self.qzeros = torch.nn.Parameter(qlinear.qzeros, requires_grad=False)
+        else:
+            self.qweight = torch.nn.Parameter(qlinear.qweight.new_zeros((qlinear.qweight.shape[0], qlinear.qweight.shape[1] // n_splits)), requires_grad=False)
+            self.scales = torch.nn.Parameter(qlinear.scales.new_zeros((qlinear.scales.shape[0], qlinear.scales.shape[1] // n_splits)), requires_grad=False)
+            self.qzeros = torch.nn.Parameter(qlinear.qzeros.new_zeros((qlinear.qzeros.shape[0], qlinear.qzeros.shape[1] // n_splits)), requires_grad=False)
+        
+        self.g_idx = torch.nn.Parameter(qlinear.g_idx, requires_grad=False)
+        self.wf_unsqueeze_zero = torch.nn.Parameter(qlinear.wf_unsqueeze_zero, requires_grad=False)
+        self.wf_unsqueeze_neg_one = torch.nn.Parameter(qlinear.wf_unsqueeze_neg_one, requires_grad=False)
+
+        self.group_size = group_size
+        self.bits = bits
+        self.symmetric = symmetric
+        #     hf_lut: torch.Tensor,
+        #     scales_off: torch.Tensor,
+        # 预计算缓冲区, 之后依据需要填充真实数据
+        self.register_buffer("lut1_", torch.zeros(128, dtype=torch.uint16))
+        self.register_buffer("eye_tile_", torch.zeros(32 * 32, dtype=torch.float16))
+        self.register_buffer("hf_lut", torch.zeros(64, dtype=torch.float16))
+        self.register_buffer("scales_off", torch.zeros(128, dtype=torch.float16))
+
+    def forward(self, a):
+        return tman_prefill_linear(
+            a,
+            self.lut1_,
+            self.eye_tile_,
+            self.hf_lut,
+            self.scales_off,
+            self.qweight,
+            self.scales,
+            self.qzeros,
+            self.g_idx,
+            self.wf_unsqueeze_zero,
+            self.wf_unsqueeze_neg_one,
+            self.group_size,
+            self.bits,
+            self.symmetric,
+            self.gptq_v2,
+        )
+
+    def extra_repr(self):
+        s = (
+            "{in_features}, {out_features}, group_size={group_size}, bits={bits}"
+            ", symmetric={symmetric}"
+        )
+        return s.format(**self.__dict__)
+
+
+def convert_linear_to_tman_prefill_linear(module: torch.nn.Module):
+    from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+    from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+
+    def replace_qlinear(module: torch.nn.Module):
+        attr_strs = dir(module)
+        if isinstance(module, torch.nn.ModuleList):
+            attr_strs += [str(i) for i in range(len(module))]
+
+        for attr_str in attr_strs:
+            target_attr = getattr(module, attr_str)
+            if isinstance(target_attr, BaseQuantLinear):
+                if not isinstance(target_attr, TorchQuantLinear):
+                    raise RuntimeError("Only GPTQ TorchQuantLinear backend is supported")
+                target_attr.post_init()
+                setattr(module, attr_str, TMANPrefillLinear(target_attr))
+
+        for _, sub_module in module.named_children():
+            sub_module = replace_qlinear(sub_module)
+        return module
+
+    return replace_qlinear(module)
+
+
 # https://github.com/huggingface/transformers/pull/37742
 class BitLinear(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool, device=None, dtype=None):
@@ -362,31 +454,32 @@ def convert_bitlinear_to_linear(module: torch.nn.Module):
     return replace_bitlinear(module)
 
 
+
+class QwenQNNLinearToConv2D(torch.nn.Module):
+    def __init__(self, weight, bias=None):
+        super().__init__()
+        use_bias = bias is not None
+        self.conv = torch.nn.Conv2d(
+            in_channels=weight.shape[0],
+            out_channels=weight.shape[1],
+            kernel_size=1,
+            padding=0,
+            bias=use_bias,
+        )
+        self.conv.weight = torch.nn.Parameter(weight.reshape(*weight.shape, 1, 1))
+        if use_bias:
+            self.conv.bias = torch.nn.Parameter(bias)
+
+    def forward(self, x):
+        rank = x.dim()
+        x = x.unsqueeze(-1) if rank == 3 else x.reshape(1, *x.shape, 1)
+        x = torch.transpose(x, 1, 2)
+        res = self.conv(x)
+        res = torch.transpose(res, 1, 2)
+        res = res.squeeze(-1) if rank == 3 else res.reshape(*res.shape[1:3])
+        return res
+
 def convert_linear_to_conv2d(module: torch.nn.Module):
-    class Conv2D(torch.nn.Module):
-        def __init__(self, weight, bias=None):
-            super().__init__()
-            use_bias = bias is not None
-            self.conv = torch.nn.Conv2d(
-                in_channels=weight.shape[0],
-                out_channels=weight.shape[1],
-                kernel_size=1,
-                padding=0,
-                bias=use_bias,
-            )
-            self.conv.weight = torch.nn.Parameter(weight.reshape(*weight.shape, 1, 1))
-            if use_bias:
-                self.conv.bias = torch.nn.Parameter(bias)
-
-        def forward(self, x):
-            rank = x.dim()
-            x = x.unsqueeze(-1) if rank == 3 else x.reshape(1, *x.shape, 1)
-            x = torch.transpose(x, 1, 2)
-            res = self.conv(x)
-            res = torch.transpose(res, 1, 2)
-            res = res.squeeze(-1) if rank == 3 else res.reshape(*res.shape[1:3])
-            return res
-
     def replace_linear(module: torch.nn.Module):
         attr_strs = dir(module)
         if isinstance(module, torch.nn.ModuleList):
@@ -395,7 +488,7 @@ def convert_linear_to_conv2d(module: torch.nn.Module):
         for attr_str in attr_strs:
             target_attr = getattr(module, attr_str)
             if isinstance(target_attr, torch.nn.Linear):
-                setattr(module, attr_str, Conv2D(target_attr.weight, target_attr.bias))
+                setattr(module, attr_str, QwenQNNLinearToConv2D(target_attr.weight, target_attr.bias))
 
         for _, sub_module in module.named_children():
             sub_module = replace_linear(sub_module)

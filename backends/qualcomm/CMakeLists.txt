@@ -150,6 +150,9 @@ target_link_libraries(
   qnn_sys_implementation PRIVATE qnn_sys_function_interface qnn_executorch_logging ${CMAKE_DL_LIBS}
 )
 target_link_libraries(qnn_executorch_logging PRIVATE qnn_schema)
+if(${ANDROID})
+  target_link_libraries(qnn_executorch_logging PRIVATE ${android_log})
+endif()
 target_link_libraries(qnn_profiler PRIVATE qnn_executorch_logging)
 target_link_libraries(qnn_logger PRIVATE qnn_implementation ${android_log})
 target_link_libraries(qnn_backend PRIVATE qnn_implementation qnn_logger)
@@ -219,7 +222,7 @@ add_subdirectory(
 install(TARGETS qnn_executorch_backend DESTINATION lib)
 
 # QNN pybind
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64")
+if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64" AND NOT ANDROID AND NOT EXECUTORCH_BUILD_PYBIND STREQUAL "OFF")
   add_subdirectory(
     ${EXECUTORCH_SOURCE_DIR}/third-party/pybind11
     ${CMAKE_CURRENT_BINARY_DIR}/pybind11

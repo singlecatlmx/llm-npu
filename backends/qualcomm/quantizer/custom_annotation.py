@@ -233,6 +233,7 @@ def annotate_matmul_16a8w(gm: torch.fx.GraphModule) -> None:  # noqa: C901
             elif node.target in [
                 torch.ops.tman.linear.default,
                 torch.ops.tman.bitnet_linear.default,
+                torch.ops.tman.prefill_linear.default,
                 torch.ops.aten.split_with_sizes.default,
                 operator.getitem,
             ]:

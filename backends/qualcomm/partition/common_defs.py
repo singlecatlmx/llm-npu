@@ -30,4 +30,5 @@ allow_list_operator = [
     _operator.getitem,
     exir_ops.edge.tman.linear.default,
     exir_ops.edge.tman.bitnet_linear.default,
+    exir_ops.edge.tman.prefill_linear.default,
 ]

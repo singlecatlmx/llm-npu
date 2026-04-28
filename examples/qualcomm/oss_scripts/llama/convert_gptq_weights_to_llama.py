@@ -8,7 +8,7 @@ from typing import List, Union
 import torch
 from tqdm import tqdm
 from gptqmodel import GPTQModel
-from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+# from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear  # 注释掉直接导入
 from gptqmodel.utils.backend import BACKEND
 import argparse
 from transformers import AutoTokenizer

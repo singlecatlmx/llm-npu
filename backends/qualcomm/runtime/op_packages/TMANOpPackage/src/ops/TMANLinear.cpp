@@ -12,14 +12,14 @@
 #include "hvx_funcs.h"
 
 #ifndef PREPARE_DISABLED
-API_EXPORT QuickShape simpledim_chunk1_4d_split_start(Replacement &rpx, Split_Context const &splitinfo, OpRef const &orig, int dim)
+static API_EXPORT QuickShape simpledim_chunk1_4d_split_start(Replacement &rpx, Split_Context const &splitinfo, OpRef const &orig, int dim)
 {
   size_t dims[4] = { 0, 0, 0, 0 };
   dims[dim] = splitinfo.start / splitinfo.size;
   return QuickShape(dims[0], dims[1], dims[2], dims[3]);
 }
 
-API_EXPORT QuickShape simpledim_chunk1_4d_split_size(Replacement &rpx, Split_Context const &splitinfo, OpRef const &orig, int dim)
+static API_EXPORT QuickShape simpledim_chunk1_4d_split_size(Replacement &rpx, Split_Context const &splitinfo, OpRef const &orig, int dim)
 {
   size_t dims[4] = {
     orig.dim(rpx.graph(), 0),
@@ -132,6 +132,8 @@ GraphStatus tmanlinearImpl(TensorType& c,
 
   const int32_t gemm_n = c.dims()[2];
   const int32_t gemm_m = c.dims()[3] / sizeof(float) / bits;
+  // 乘以32的原因是 量化权重 是以 int32_t存储的，qweight.dims()[2] * qweight.dims()[3]是int32_t个数，
+  // 乘以32是总的bit数， bits是每个权重的位宽， / bit 得到 权重总元素个数
   const int32_t gemm_k = qweight.dims()[2] * qweight.dims()[3] * 32 / bits / gemm_m;
 
   const int32_t l_size  = gemm_k / LUT_G * LUT_SIZE;

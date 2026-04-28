@@ -550,7 +550,16 @@ def compile(args, pte_filename, tokenizer):
 
     if args.gptq_dir:
         from gptqmodel.quantization.config import QuantizeConfig
-        from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+        # 使用动态导入避免循环导入
+        try:
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+        except ImportError as e:
+            print(f"Warning: Failed to import TorchQuantLinear: {e}")
+            TorchQuantLinear = None
+        
+        if TorchQuantLinear is None:
+            raise RuntimeError("TorchQuantLinear could not be imported")
+            
         qcfg = QuantizeConfig.from_pretrained(args.gptq_dir)
         if qcfg.desc_act:
             raise RuntimeError(

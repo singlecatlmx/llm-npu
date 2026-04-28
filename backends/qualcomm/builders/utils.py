@@ -130,13 +130,13 @@ def deduce_dtype(
 
 
 def parse_gptqv2(qweight: np.ndarray, scales: np.ndarray, qzeros: np.ndarray) -> Tuple:
-    assert qweight.dtype == "int32"
-    assert qzeros.dtype == "int32"
+    assert qweight.dtype == "int32" # int32是存储格式
+    assert qzeros.dtype == "int32" # zeros是数据范围偏移量，为了表示是否是非对称量化，包含零点偏移量，数据类型和量化权重相同
 
     bits = 32 // (scales.shape[1] // qzeros.shape[1])
-    K = qweight.shape[0] * (32 // bits)
-    M = qweight.shape[1]
-    group_size = K // scales.shape[0]
+    K = qweight.shape[0] * (32 // bits) # 一个int32包含（32 // bits）个量化权重
+    M = qweight.shape[1]                # qweight shape is (K // (32 // bits), M)
+    group_size = K // scales.shape[0]   # per block 是 在每个通道上 逐block量化，所以M维不变，K维度分成每group size一组  （group number， M）
 
     return K, M, bits, group_size
 
@@ -150,6 +150,9 @@ def unpack_gptqv2(qweight: np.ndarray, scales: np.ndarray, qzeros: np.ndarray, g
     assert qzeros.dtype == "int32"
     # TODO: support other pack_dtypes
 
+    # qweight shape is (K // (32 // bits), M)
+    # scales shape is (K // group_size, M)
+    # zeros shape is (K // (group_size) // (32 // bits), M)
     K, M, bits, group_size = parse_gptqv2(qweight, scales, qzeros)
 
     # Detect symmetry
@@ -162,8 +165,9 @@ def unpack_gptqv2(qweight: np.ndarray, scales: np.ndarray, qzeros: np.ndarray, g
     symmetric = not (qzeros - np.uint32(sym_zero).astype(np.int32)).any()
 
     # Unpack qweight
+    # [(K // 8, M), (K // 8, M), ... ] 8个元素
     qweights = [(qweight >> bit_offset) & ((1 << bits) - 1) for bit_offset in range(0, 32, bits)]
-    w = np.stack(qweights, axis=1).reshape(K, M).T.astype("uint8")
+    w = np.stack(qweights, axis=-1).reshape(K, M).T.astype("uint8") 
 
     scales = scales.T
 
@@ -175,7 +179,10 @@ def unpack_gptqv2(qweight: np.ndarray, scales: np.ndarray, qzeros: np.ndarray, g
         # Not in GPTQModel
         zeros += 1
     zeros = (zeros - (2 ** (bits - 1)))
-
+    #         shape                 type
+    # w       (M, K)                uint8
+    # sclaes  (M, K // group_size)  fp16
+    # zeros   (M, K // group_size)  fp16
     return w, scales, zeros, bits, group_size, symmetric
 
 
@@ -209,8 +216,8 @@ def hvx_preprocess_weights(
     w = np.stack([(w >> ib) & 1 for ib in range(bits)], axis=-1)
     # (M, K, bits) -> (M, bits, K) -> (M, bits, K) -> (M, bits, K // g, g)
     w = w.transpose(0, 2, 1).reshape(M, bits, Q, g)
-    # (M, bits, K // g, g) -> (M, bits, Q)
-    w = sum([(w[:, :, :, ig] << ig) for ig in range(g)])
+    # (M, bits, Q, g) -> (M, bits, Q)
+    w = sum([(w[:, :, :, ig] << ig) for ig in range(g)])  
     # (M, bits, Q) -> (M // vec_p, vec_p, bits, Q) -> (M // vec_p, bits, vec_p, Q) -> (P // vec_p, vec_p, Q)
     w = w.reshape(M // vec_p, vec_p, bits, Q).transpose(0, 2, 1, 3)
     # Interleave even and odd vec_c of w_vec
@@ -229,7 +236,7 @@ def hvx_preprocess_weights(
     w = sum([(w[:, :, :, n] << (n * g)) for n in range(2)])
     w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, tile_q // vec_q, vec_q // 2, vec_p)
     # Reshape for easy tiling
-    w = np.ascontiguousarray(w).view(np.int32).reshape(P // tile_p, -1)
+    w = np.ascontiguousarray(w).view(np.int32).reshape(P // tile_p, -1) # 权重中元素类型是
 
     if scales.size >= M:  # GPTQ
         group_size = K // scales.shape[1]
@@ -326,3 +333,85 @@ def unpack_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         unpacked[start:end] = (packed & mask) >> (2 * i)
 
     return unpacked.to(dtype) - 1
+
+
+
+
+# TODO: edit to shuff 
+def precompute_lut1() -> np.ndarray:
+    vec_16 = np.arange(16, dtype=np.uint16)
+    l = [(vec_16 >> i) & 1 for i in range(4)]
+    #print(l)
+    lut1 = np.zeros((128,), dtype=np.uint16)
+    
+    for bit in range(4):
+        lut1_bit_lo = (l[0] << bit) | (l[1] << (bit + 8))
+        lut1_bit_hi = (l[2] << bit) | (l[3] << (bit + 8))
+        lut1[bit*16 : (bit+1)*16] = lut1_bit_lo
+        lut1[64 + bit*16 : 64 + (bit+1)*16] = lut1_bit_hi
+    for i, val in enumerate(lut1[:128]):
+        # {val:016b} 得到的字符串可以用切片插入下划线，或者直接格式化
+        binary_str = f"{val:016b}"
+        formatted_bin = binary_str[:8] + "_" + binary_str[8:]
+        #print(f"[{i:03d}] {formatted_bin}")
+    # print(lut1)
+    lut1_shuffled = lut1.reshape(2, 2, 32).transpose(0, 2, 1).flatten()
+    # print("=================================================")
+    # print(lut1_shuffled)
+
+    return lut1_shuffled
+
+
+# def precompute_eye_tile() -> np.ndarray:
+#     VLEN = 128
+#     words_per_vec = VLEN // 4 # 32 words
+    
+#     vtcm_eye_tile = np.zeros((16, words_per_vec), dtype=np.int32)
+    
+#     # Start with a clean vector
+#     v = np.zeros(words_per_vec, dtype=np.int32)
+    
+#     v[0] = 0x00003c00
+#     v[1] = 0x3c000000
+    
+#     for i in range(16):
+#         # Assign the current state of the vector to the row
+#         vtcm_eye_tile[i] = v
+        
+#         # Shift left by 2 words for the next row (vror VLEN-8)
+#         v = np.roll(v, 2) 
+        
+#     return np.ascontiguousarray(vtcm_eye_tile)
+
+def precompute_eye_tile() -> np.ndarray:
+    eye_tile = np.eye(32, dtype=np.float16)
+    np.set_printoptions(linewidth=np.inf, precision=0, suppress=True)
+    # with np.printoptions(threshold=np.inf):
+    #     print(eye_tile)
+    
+    result = eye_tile.reshape(16, 2, 32).transpose(0, 2, 1).flatten().reshape(32, 32)
+    # with np.printoptions(threshold=np.inf):
+    #     print(result)
+    result = result.view(np.uint16)
+    return result
+    
+
+
+def precompute_hf_lut() -> np.ndarray:
+    hf_lut = np.arange(16, dtype=np.float16)
+    lut = np.zeros(64, dtype=np.float16)
+    lut[0:16] = hf_lut
+    lut[16:32] = hf_lut
+    lut[32:48] = hf_lut
+    lut[48:64] = hf_lut
+
+    result = lut.reshape(1, 2, 32).transpose(0, 2, 1).flatten()
+    result = result.view(np.uint16)
+    return result
+
+def precompute_scales_off() -> np.ndarray:
+    scales_off = np.zeros(128, dtype=np.float16)
+    scales_off[0:64] = 1.0
+    result = scales_off.view(np.uint16)
+    return result
+

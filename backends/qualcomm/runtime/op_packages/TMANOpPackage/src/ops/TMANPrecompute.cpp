@@ -54,6 +54,7 @@ DEF_PACKAGE_PARAM_ORDER("TMANPrecompute",
                         &sg_opDefaultSymmetric)
 
 template<typename TensorType>
+// 输出、输入、参数都是预先分配内存的，在调用此函数前，tensor的shape是确定的，内存也已经分配
 GraphStatus tmanprecomputeImpl(TensorType& l,
                                const TensorType& x,
                                const Int32Tensor& t_group_size,
@@ -68,14 +69,20 @@ GraphStatus tmanprecomputeImpl(TensorType& l,
   constexpr int32_t LUT_SIZE       = 16;
 
   const int32_t gemm_k = x.dims()[3];
-  const int32_t gemm_n = x.dims()[2];
+  const int32_t gemm_n = x.dims()[2]; 
+  // 这是decoding阶段，激活值的shape应该是（1，1，1，k）, n应该是 1
+  // 那么 gemm_k是激活值的元素总数
 
   const int32_t group_size = ((const int32_t*)t_group_size.raw_data_const())[0];
   const bool zero_point    = ((const int32_t*)t_symmetric.raw_data_const())[0] == 0;
 
+  // 每LUT_G个权重生成一个LUT，每个LUT大小是LUT_SIZE。所以 LUT大小是 k / LUT_G * LUT_SIZE
+  // LUT_SIZE是16的原因是每4个权重的某一个bit位的组合有 16种
   const int32_t l_size  = gemm_k / LUT_G * LUT_SIZE;
   const int32_t real_act_group_size = (group_size == 0) ? -1 : ACT_GROUP_SIZE;
-  const int32_t ls_size = (real_act_group_size == -1) ? 1 : (gemm_k / real_act_group_size);
+
+  // gemm_k是激活值总数，gemm_k / real_act_group_size是分组量化所需分组数量
+  const int32_t ls_size = (real_act_group_size == -1) ? 1 : (gemm_k / real_act_group_size); 
 
   const XType* x_ptr = (const XType*)x.raw_data_const();
   LType* l_ptr = (LType*)l.raw_data();

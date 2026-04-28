@@ -11,6 +11,8 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
+import shutil
 
 
 def python_is_compatible():
@@ -74,30 +76,120 @@ TORCH_NIGHTLY_URL = "https://download.pytorch.org/whl/nightly/cpu"
 NIGHTLY_VERSION = "dev20250325"
 
 
+def install_pytorch_from_source(target_date="2025-03-25"):
+    """Install PyTorch from source for the specific date."""
+    print(f"Installing PyTorch from source for date: {target_date}")
+    
+    # 使用持久化目录，不要每次都删除
+    pytorch_dir = "/tmp/pytorch_build_cache"
+    
+    # 如果目录已存在且是git仓库，就更新而不是重新克隆
+    if os.path.exists(pytorch_dir) and os.path.exists(os.path.join(pytorch_dir, ".git")):
+        print("找到现有PyTorch源码缓存，更新中...")
+        original_cwd = os.getcwd()
+        os.chdir(pytorch_dir)
+        try:
+            subprocess.run(["git", "fetch", "origin"], check=True)
+            subprocess.run(["git", "reset", "--hard", "HEAD"], check=True)
+        finally:
+            os.chdir(original_cwd)
+    else:
+        # 删除可能损坏的目录并重新克隆
+        if os.path.exists(pytorch_dir):
+            shutil.rmtree(pytorch_dir)
+        
+        print("克隆PyTorch仓库...")
+        subprocess.run([
+            "git", "clone", "--recursive", 
+            "https://github.com/pytorch/pytorch.git", 
+            pytorch_dir
+        ], check=True)
+    
+    # Find commit for the target date
+    original_cwd = os.getcwd()
+    os.chdir(pytorch_dir)
+    
+    try:
+        # Get commit for the target date
+        result = subprocess.run([
+            "git", "rev-list", "-n", "1", 
+            f"--before='{target_date} 23:59:59'", "main"
+        ], capture_output=True, text=True, check=True)
+        
+        commit_hash = result.stdout.strip()
+        print(f"Found commit for {target_date}: {commit_hash}")
+        
+        # Checkout the specific commit
+        subprocess.run(["git", "checkout", commit_hash], check=True)
+        subprocess.run(["git", "submodule", "sync"], check=True)
+        subprocess.run(["git", "submodule", "update", "--init", "--recursive"], check=True)
+        
+        # Build and install
+        env = os.environ.copy()
+        env['USE_CUDA'] = '0'  # CPU only build
+        env['BUILD_TEST'] = '0'
+        env['USE_MKLDNN'] = '0'
+        env['USE_NNPACK'] = '0'
+        
+        print("Building PyTorch from source (this may take a while)...")
+        subprocess.run([sys.executable, "setup.py", "install"], env=env, check=True)
+        
+        print("PyTorch installed successfully from source!")
+        
+    finally:
+        os.chdir(original_cwd)
+        # 不删除源码缓存，保留以备后用
+        print(f"PyTorch源码已保存到: {pytorch_dir}")
+
+
+def check_torch_version():
+    """检查当前安装的PyTorch版本"""
+    try:
+        import torch
+        version = torch.__version__
+        print(f"当前PyTorch版本: {version}")
+        
+        # 检查是否是我们期望的源码版本
+        if "git" in version and "2.8.0" in version:
+            print("✅ 检测到正确的源码构建版本")
+            return True
+        else:
+            print("❌ 当前版本不是期望的源码版本")
+            return False
+    except ImportError:
+        print("❌ PyTorch未安装")
+        return False
+
+
 def install_requirements(use_pytorch_nightly):
-    # pip packages needed by exir.
-    EXIR_REQUIREMENTS = [
-        # Setting use_pytorch_nightly to false to test the pinned PyTorch commit. Note
-        # that we don't need to set any version number there because they have already
-        # been installed on CI before this step, so pip won't reinstall them
-        f"torch==2.8.0.{NIGHTLY_VERSION}" if use_pytorch_nightly else "torch",
-        (
-            f"torchvision==0.22.0.{NIGHTLY_VERSION}"
-            if use_pytorch_nightly
-            else "torchvision"
-        ),  # For testing.
-    ]
+    # 首先检查是否已经安装了正确的PyTorch版本
+    print("=== 检查当前PyTorch版本 ===")
+    if check_torch_version():
+        print("✅ 已有正确的PyTorch版本，跳过重新安装")
+        torch_source_installed = True
+    else:
+        # 强制只从源码安装PyTorch 2025-03-25版本
+        print("=== 强制从Git源码构建PyTorch ===")
+        print("跳过PyPI安装，直接构建2025-03-25版本的PyTorch...")
+        
+        try:
+            install_pytorch_from_source("2025-03-25")
+            print("✅ PyTorch源码构建完成!")
+            torch_source_installed = True
+        except Exception as e:
+            print(f"❌ 源码构建失败: {e}")
+            print("ERROR: 无法继续，必须使用2025-03-25版本的PyTorch")
+            sys.exit(1)
+    
+    # 永远不通过pip安装torch - 只使用我们从源码构建的版本
+    EXIR_REQUIREMENTS = []
+    
+    # 对于其他torch相关包，使用兼容的stable版本，避免版本冲突
+    VISION_REQUIREMENTS = ["torchvision"]  # 使用stable版本
+    EXAMPLES_REQUIREMENTS = ["torchaudio"]  # 使用stable版本
 
-    EXAMPLES_REQUIREMENTS = [
-        f"torchaudio==2.6.0.{NIGHTLY_VERSION}" if use_pytorch_nightly else "torchaudio",
-    ]
-
-    # Assemble the list of requirements to actually install.
-    # TODO: Add options for reducing the number of requirements.
-    REQUIREMENTS_TO_INSTALL = EXIR_REQUIREMENTS + EXAMPLES_REQUIREMENTS
-
-    # Install the requirements. `--extra-index-url` tells pip to look for package
-    # versions on the provided URL if they aren't available on the default URL.
+    # 首先安装基础requirements (不包含依赖torch的包)
+    print("=== 安装基础依赖包 ===")
     subprocess.run(
         [
             sys.executable,
@@ -105,12 +197,38 @@ def install_requirements(use_pytorch_nightly):
             "pip",
             "install",
             "-r",
-            "requirements-examples.txt",
-            "-r",
-            "requirements-dev.txt",
-            *REQUIREMENTS_TO_INSTALL,
-            "--extra-index-url",
-            TORCH_NIGHTLY_URL,
+            "requirements-dev.txt",  # 只安装开发依赖，不包含torch相关
+        ],
+        check=True,
+    )
+    
+    # 然后安装torch相关的辅助包
+    print("=== 安装torch相关辅助包 ===")
+    torch_related_packages = VISION_REQUIREMENTS + EXAMPLES_REQUIREMENTS
+    if torch_related_packages:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip", 
+                "install",
+                *torch_related_packages,
+                "--no-deps",  # 关键：不安装依赖，避免重新安装torch
+            ],
+            check=True,
+        )
+    
+    # 最后单独安装需要torch的examples包
+    print("=== 安装需要torch的示例包 ===")
+    examples_packages = ["timm==1.0.7", "torchsr==1.0.4", "transformers==4.47.1"]
+    subprocess.run(
+        [
+            sys.executable,
+            "-m", 
+            "pip",
+            "install",
+            *examples_packages,
+            "--no-deps",  # 不安装依赖，使用我们已有的torch
         ],
         check=True,
     )

@@ -89,7 +89,8 @@ from torch.ao.quantization.observer import MinMaxObserver
 from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
 
 from gptqmodel import GPTQModel
-from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+# 延迟导入TorchQuantLinear以避免循环导入
+# from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
 
 sys.setrecursionlimit(4096)
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
@@ -534,6 +535,21 @@ def compile(args, pte_filename, tokenizer):
         raise RuntimeError(
             "desc_act=True is unsupported right now."
         )
+    
+    # 动态导入TorchQuantLinear以避免循环导入问题
+    try:
+        import importlib
+        torch_qlinear_module = importlib.import_module('gptqmodel.nn_modules.qlinear.torch')
+        TorchQuantLinear = getattr(torch_qlinear_module, 'TorchQuantLinear')
+        logging.info("TorchQuantLinear动态导入成功")
+    except ImportError as e:
+        # 如果导入失败，尝试直接导入
+        try:
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+            logging.info("TorchQuantLinear直接导入成功")
+        except ImportError as e2:
+            raise RuntimeError(f"无法导入TorchQuantLinear: 动态导入失败({e}), 直接导入失败({e2})")
+    
     qlinear_cls = partial(
         TorchQuantLinear,
         bits=qcfg.bits,

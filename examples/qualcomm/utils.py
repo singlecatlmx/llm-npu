@@ -109,13 +109,40 @@ class SimpleADB:
             cmds, stdout=subprocess.DEVNULL if self.error_only else sys.stdout
         )
 
+    def _adb_check(self, cmd) -> bool:
+        if not self.host_id:
+            cmds = ["adb", "-s", self.device_id]
+        else:
+            cmds = ["adb", "-H", self.host_id, "-s", self.device_id]
+        cmds.extend(cmd)
+
+        result = subprocess.run(
+            cmds,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+
     def push(self, inputs=None, input_list=None, files=None):
-        self._adb(["shell", f"rm -rf {self.workspace}"])
-        self._adb(["shell", f"mkdir -p {self.workspace}"])
+        existing_pte = set()
+        for pte_path in self.pte_path:
+            pte_name = os.path.basename(pte_path)
+            if self._adb_check(["shell", f"test -f {self.workspace}/{pte_name}"]):
+                existing_pte.add(pte_name)
+
+        if existing_pte:
+            self._adb(["shell", f"mkdir -p {self.workspace}"])
+        else:
+            self._adb(["shell", f"rm -rf {self.workspace}"])
+            self._adb(["shell", f"mkdir -p {self.workspace}"])
 
         # necessary artifacts
         artifacts = [
-            *self.pte_path,
+            *[
+                pte_path
+                for pte_path in self.pte_path
+                if os.path.basename(pte_path) not in existing_pte
+            ],
             f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtp.so",
             (
                 f"{self.qnn_sdk}/lib/hexagon-v{self.htp_arch}/"

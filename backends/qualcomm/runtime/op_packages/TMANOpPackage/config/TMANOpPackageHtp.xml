@@ -106,5 +106,136 @@
 
             <SupportedBackend>HTP</SupportedBackend>
         </OpDef>
+
+        <OpDef>
+            <Name>TMANPrefillLinear</Name>
+            <Description>
+                <Content>Fused Dequant + HMX MatMul</Content>
+            </Description>
+            <Input>
+                <Name>a</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>lut1_</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UINT_16</Datatype>
+                <Shape>
+                    <Rank>N</Rank>
+                    <Layout>ANY</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Input>
+                <Name>eye_tile_</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>N</Rank>
+                    <Layout>ANY</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Input>
+                <Name>qweight</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Input>
+                <Name>scales</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+                <IsStaticTensor>true</IsStaticTensor>
+            </Input>
+
+            <Output>
+                <Name>y</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Layout>NHWC</Layout>
+                </Shape>
+            </Output>
+
+            <Output>
+                <Name>act_temp_</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>N</Rank>
+                    <Layout>ANY</Layout>
+                </Shape>
+            </Output>
+
+            <Output>
+                <Name>weight_temp_</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>N</Rank>
+                    <Layout>ANY</Layout>
+                </Shape>
+            </Output>
+
+            <Output>
+                <Name>output_temp_</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Shape>
+                    <Rank>N</Rank>
+                    <Layout>ANY</Layout>
+                </Shape>
+            </Output>
+
+            <Parameter>
+                <Name>group_size</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>64</Default>
+            </Parameter>
+
+            <Parameter>
+                <Name>bits</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>4</Default>
+            </Parameter>
+            
+            <Parameter>
+                <Name>symmetric</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                </Shape>
+                <Default>0</Default>
+            </Parameter>
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
     </OpDefList>
 </OpDefCollection>

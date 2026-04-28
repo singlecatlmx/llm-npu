@@ -1,0 +1,4 @@
+var searchData=
+[
+  ['functions_0',['Functions',['../group__NPUMicroAccumulator.html',1,'Accumulator Functions'],['../group__CPUMacroLayout.html',1,'Data Layout Transformation Functions'],['../group__NPUMacroLayout.html',1,'Data Layout Transformation Functions'],['../group__NPUMicroLayout.html',1,'Data Layout Transformation Functions'],['../group__NPUMicroDataMove.html',1,'Data Movement Functions'],['../group__CPUMacroGeneral.html',1,'General Functions'],['../group__NPUMacroGeneral.html',1,'General Functions'],['../group__NPUMicroGeneral.html',1,'General Functions'],['../group__CPUMacroMatMul.html',1,'Matrix Multiplication Functions'],['../group__NPUMacroMatMul.html',1,'Matrix Multiplication Functions'],['../group__NPUMicroMatMul.html',1,'Matrix Multiplication Functions'],['../group__CPUMacroValidate.html',1,'Validation Functions']]]
+];

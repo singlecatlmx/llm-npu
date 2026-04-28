@@ -9,8 +9,9 @@
 # Install tiktoken for tokenizer.
 # Install tokenizers for hf .json tokenizer.
 # Install snakeviz for cProfile flamegraph
-# Install lm-eval for Model Evaluation with lm-evalution-harness.
-pip install huggingface_hub tiktoken torchtune sentencepiece tokenizers snakeviz lm_eval==0.4.5 blobfile
+# Install lm-eval for Model Evaluation with lm-evalution-harness (no-deps to preserve custom torch version).
+pip install huggingface_hub tiktoken torchtune sentencepiece tokenizers snakeviz blobfile
+pip install lm_eval==0.4.5 --no-deps
 
 # Call the install helper for further setup
 python examples/models/llama/install_requirement_helper.py

@@ -124,6 +124,65 @@ def tman_linear_fake(
     return x.new_zeros(out_shape)
 
 
+@torch.library.custom_op("tman::prefill_linear", mutates_args=())
+def tman_prefill_linear(
+    a: torch.Tensor,
+    lut1_: torch.Tensor,
+    eye_tile_: torch.Tensor,
+    hf_lut: torch.Tensor,
+    scales_off: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    # 模拟真实的前向计算，复用 _dequantize_weight 函数来与 cpu 对比精度
+    out_features = qweight.shape[1]
+    out_shape = a.shape[:-1] + (out_features,)
+    a_reshaped = a.reshape(-1, a.shape[-1])
+
+    weights = _dequantize_weight(
+        qweight,
+        scales,
+        qzeros,
+        g_idx,
+        wf_unsqueeze_zero,
+        wf_unsqueeze_neg_one,
+        bits,
+    ).to(a_reshaped.dtype)
+
+    out = torch.matmul(a_reshaped, weights).reshape(out_shape)
+    return out.to(a_reshaped.dtype)
+
+
+@tman_prefill_linear.register_fake
+def tman_prefill_linear_fake(
+    a: torch.Tensor,
+    lut1_: torch.Tensor,
+    eye_tile_: torch.Tensor,
+    hf_lut: torch.Tensor,
+    scales_off: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    g_idx: torch.Tensor,
+    wf_unsqueeze_zero: torch.Tensor,
+    wf_unsqueeze_neg_one: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool,
+    gptq_v2: bool,
+) -> torch.Tensor:
+    out_features = qweight.shape[1]
+    out_shape = a.shape[:-1] + (out_features,)
+    return a.new_zeros(out_shape)
+
 @torch.library.custom_op("tman::bitnet_linear", mutates_args=())
 def tman_bitnet_linear(
     x: torch.Tensor,

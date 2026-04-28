@@ -1,7 +1,18 @@
-from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+# from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear  # 注释掉直接导入
 import torch
 import os
 import numpy as np
+
+# 动态导入TorchQuantLinear以避免循环导入问题
+try:
+    import importlib
+    torch_qlinear_module = importlib.import_module('gptqmodel.nn_modules.qlinear.torch')
+    TorchQuantLinear = getattr(torch_qlinear_module, 'TorchQuantLinear')
+except ImportError as e:
+    try:
+        from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+    except ImportError as e2:
+        raise RuntimeError(f"无法导入TorchQuantLinear: 动态导入失败({e}), 直接导入失败({e2})")
 
 M, K, N = 2048, 8192, 1
 bits = 4

@@ -41,6 +41,7 @@ build_android_native_library() {
     -DBUILD_TESTING=OFF \
     -DEXECUTORCH_ENABLE_LOGGING=ON \
     -DEXECUTORCH_LOG_LEVEL=Info \
+    -DEXECUTORCH_BUILD_PYBIND=OFF \
     -DEXECUTORCH_BUILD_XNNPACK=ON \
     -DEXECUTORCH_XNNPACK_SHARED_WORKSPACE=ON \
     -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
@@ -115,9 +116,9 @@ build_aar() {
     find cmake-out-android-so -type f -name "*.so" -exec "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-strip {} \;
   fi
   pushd extension/android/
-  ANDROID_HOME="${ANDROID_SDK:-/opt/android/sdk}" ./gradlew build
+  ANDROID_HOME="${ANDROID_HOME:-/workspaces/android-sdk}" ./gradlew build
   # Use java unit test as sanity check
-  ANDROID_HOME="${ANDROID_SDK:-/opt/android/sdk}" ./gradlew :executorch_android:testDebugUnitTest
+  ANDROID_HOME="${ANDROID_HOME:-/workspaces/android-sdk}" ./gradlew :executorch_android:testDebugUnitTest
   popd
   if [ ! -z $BUILD_AAR_DIR ]; then
     cp extension/android/executorch_android/build/outputs/aar/executorch_android-debug.aar "${BUILD_AAR_DIR}/executorch.aar"

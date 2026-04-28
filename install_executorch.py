@@ -234,6 +234,14 @@ def main(args):
     #
 
     # Set environment variables
+    cmake_args_str = " ".join(cmake_args)
+    
+    # 自动添加QNN_SDK_ROOT如果启用了QNN且未指定
+    if "-DEXECUTORCH_BUILD_QNN=ON" in cmake_args_str and "QNN_SDK_ROOT" not in cmake_args_str:
+        qnn_sdk_path = "/opt/qnn"  # 默认QNN SDK路径
+        cmake_args.append(f"-DQNN_SDK_ROOT={qnn_sdk_path}")
+        print(f"自动添加QNN SDK路径: {qnn_sdk_path}")
+    
     os.environ["CMAKE_ARGS"] = " ".join(cmake_args)
 
     # Check if the required submodules are present and update them if not

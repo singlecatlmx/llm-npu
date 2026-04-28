@@ -24,8 +24,9 @@ def apply_rotary_emb_single(
     x_r, x_i = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     # broadcast for batch_prefill mode input x
     if x.dim() == 4:
-        freqs_cos = freqs_cos[None, None, :, :]
-        freqs_sin = freqs_sin[None, None, :, :]
+        # x is [B, S, H, D], so RoPE factors should broadcast on sequence dim.
+        freqs_cos = freqs_cos[None, :, None, :]
+        freqs_sin = freqs_sin[None, :, None, :]
     x_out_r = x_r * freqs_cos - x_i * freqs_sin
     x_out_i = x_r * freqs_sin + x_i * freqs_cos
 
@@ -82,6 +83,17 @@ class Qwen3Attention(nn.Module):
         self.q_norm = torch.nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = torch.nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
 
+    @staticmethod
+    def _fit_attn_mask(
+        atten_mask: torch.Tensor, target_q_len: int, target_k_len: int
+    ) -> torch.Tensor:
+        fitted = atten_mask
+        if fitted.size(-2) != target_q_len:
+            fitted = fitted[..., -target_q_len:, :]
+        if fitted.size(-1) != target_k_len:
+            fitted = fitted[..., -target_k_len:]
+        return fitted
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -114,7 +126,9 @@ class Qwen3Attention(nn.Module):
                 cache_idx = i // self.num_key_value_groups
 
                 attn = q[:, :, i, :] @ kh[cache_idx]
-                attn = attn * self.scaling + atten_mask
+                attn = attn * self.scaling + self._fit_attn_mask(
+                    atten_mask, attn.size(-2), attn.size(-1)
+                )
                 attn = self.attn_softmax(attn)
                 y = attn @ vh[cache_idx]
 
@@ -128,7 +142,9 @@ class Qwen3Attention(nn.Module):
                 cache_idx = i // self.num_key_value_groups
 
                 attn = q[:, :, i, :] @ kh[:, cache_idx, :, :]
-                attn = attn * self.scaling + atten_mask
+                attn = attn * self.scaling + self._fit_attn_mask(
+                    atten_mask, attn.size(-2), attn.size(-1)
+                )
                 attn = self.attn_softmax(attn)
                 y = attn @ vh[:, :, cache_idx, :]
 
@@ -234,7 +250,9 @@ class Qwen3Attention(nn.Module):
         for i, _ in enumerate(q):
             cache_idx = i // self.num_key_value_groups
             attn = q[i] @ kh[cache_idx]
-            attn = attn * self.scaling + atten_mask
+            attn = attn * self.scaling + self._fit_attn_mask(
+                atten_mask, attn.size(-2), attn.size(-1)
+            )
             attn = self.attn_softmax(attn)
             y = attn @ vh[cache_idx]
 
@@ -293,7 +311,9 @@ class Qwen3Attention(nn.Module):
         for i, _ in enumerate(q):
             cache_idx = i // self.num_key_value_groups
             attn = q[i] @ kh[cache_idx]
-            attn = attn * self.scaling + atten_mask
+            attn = attn * self.scaling + self._fit_attn_mask(
+                atten_mask, attn.size(-2), attn.size(-1)
+            )
             attn = self.attn_softmax(attn)
             y = attn @ vh[cache_idx]
 
@@ -403,12 +423,13 @@ class Qwen3Model(nn.Module):
         output_k_cache = []
         output_v_cache = []
         # following tensors should be invariant across batches
-        freqs_cos = (
-            self.freqs_cos[input_pos][0] if self.use_kv_cache else self.freqs_cos
-        )
-        freqs_sin = (
-            self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
-        )
+        if self.use_kv_cache and input_pos is not None:
+            freqs_cos = self.freqs_cos[input_pos][0]
+            freqs_sin = self.freqs_sin[input_pos][0]
+        else:
+            seq_len = tokens.size(1)
+            freqs_cos = self.freqs_cos[:seq_len]
+            freqs_sin = self.freqs_sin[:seq_len]
 
         hidden_states = self.embed_tokens(tokens)
         for ind, decoder_layer in enumerate(self.layers):

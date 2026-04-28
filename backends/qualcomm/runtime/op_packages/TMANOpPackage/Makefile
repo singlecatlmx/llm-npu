@@ -38,13 +38,13 @@ HEXAGON_SDK_ROOT_V73 := $(HEXAGON_SDK_ROOT)
 HEXAGON_SDK_ROOT_V75 := $(HEXAGON_SDK_ROOT)
 HEXAGON_SDK_ROOT_V79 := $(HEXAGON_SDK_ROOT)
 HEXAGON_SDK_ROOT_X86 := $(HEXAGON_SDK_ROOT)
-HEXAGON_TOOLS_VERSION_V68 := 8.4.09
-HEXAGON_TOOLS_VERSION_V69 := 8.5.03
-HEXAGON_TOOLS_VERSION_V73 := 8.6.02
-HEXAGON_TOOLS_VERSION_V75 := 8.8.06
-HEXAGON_TOOLS_VERSION_V79 := 8.8.06
+HEXAGON_TOOLS_VERSION_V68 := 19.0.07
+HEXAGON_TOOLS_VERSION_V69 := 19.0.07
+HEXAGON_TOOLS_VERSION_V73 := 19.0.07
+HEXAGON_TOOLS_VERSION_V75 := 19.0.07
+HEXAGON_TOOLS_VERSION_V79 := 19.0.07
 #Updated to point to latest sdk to match with libQnnHtp.so
-HEXAGON_TOOLS_VERSION_X86 := 8.8.06
+HEXAGON_TOOLS_VERSION_X86 := 19.0.07
 
 ifndef ANDROID_NDK_ROOT
 ifeq ($(MAKECMDGOALS),htp_aarch64)
@@ -68,8 +68,12 @@ OP_INCLUDES := $(wildcard $(OP_INCLUDE_DIR)/*.h) # user defined if any op specif
 LIBRARY_NAME := libQnn$(PACKAGE_NAME).so
 SUPPORTED_TARGETS = x86_64-linux-clang hexagon-v68 hexagon-v69 hexagon-v73 hexagon-v75 hexagon-v79 aarch64-android
 
+EXTRA_INCLUDE_DIRS := $(HEXKL)/include \
+                      $(HEXAGON_SDK_ROOT)/incs \
+                      $(HEXAGON_SDK_ROOT)/incs/stddef
 
 COMMON_CXX_FLAGS = -std=c++17 -I$(QNN_INCLUDE) -I$(OP_INCLUDE_DIR) -fPIC -Wall -Wreorder -Wno-missing-braces -Wno-unused-function -Wno-unused-variable
+COMMON_CXX_FLAGS += $(addprefix -I, $(EXTRA_INCLUDE_DIRS))
 COMMON_CXX_FLAGS += -Werror -Wno-format -Wno-unused-command-line-argument -fvisibility=default -stdlib=libc++
 COMMON_CXX_FLAGS += -DQNN_API="__attribute__((visibility(\"default\")))"  -D__QAIC_HEADER_EXPORT="__attribute__((visibility(\"default\")))"
 
@@ -156,7 +160,7 @@ X86_CXX_FLAGS = $(COMMON_CXX_FLAGS) $(X86_C_FLAGS) -fomit-frame-pointer -Wno-inv
 linux_objs =
 #============================================================================================================
 # Setup compiler, compiler instructions and linker for hexagon
-HEXAGON_CXX_FLAGS := $(COMMON_CXX_FLAGS) -mhvx -mhvx-length=128B -mhmx -DUSE_OS_QURT -O2 -Wno-reorder -DPREPARE_DISABLED
+HEXAGON_CXX_FLAGS := $(COMMON_CXX_FLAGS) -mhvx -mhvx-length=128B -mhvx-ieee-fp -mhmx -DUSE_OS_QURT -O2 -Wno-reorder -DPREPARE_DISABLED
 
 HEXAGON_CXX_FLAGS_V68 := $(HEXAGON_CXX_FLAGS) -mv68 -I$(HEXAGON_SDK_ROOT_V68)/rtos/qurt/computev68/include/qurt -I$(HEXAGON_SDK_ROOT_V68)/rtos/qurt/computev68/include/posix -I$(HEXAGON_SDK_ROOT_V68)/incs -I$(HEXAGON_SDK_ROOT_V68)/incs/stddef
 HEXAGON_CXX_FLAGS_V69 := $(HEXAGON_CXX_FLAGS) -mv69 -I$(HEXAGON_SDK_ROOT_V69)/rtos/qurt/computev69/include/qurt -I$(HEXAGON_SDK_ROOT_V69)/rtos/qurt/computev69/include/posix -I$(HEXAGON_SDK_ROOT_V69)/incs -I$(HEXAGON_SDK_ROOT_V69)/incs/stddef
